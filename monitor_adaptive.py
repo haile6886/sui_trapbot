@@ -691,10 +691,27 @@ def main_loop():
         except KeyboardInterrupt:
             logging.info("Interrupted by user. Exiting.")
             break
+                    # keepalive log mỗi 10 phút để Railway không sleep
+        if counter % 60 == 0:  # khoảng 10 phút nếu INTERVAL ~10s
+            logging.info("[keepalive] Bot running normally – still alive ✅")
+        counter += 1
         except Exception as e:
             logging.error("[ERR] %s", e)
             logging.error(traceback.format_exc())
             time.sleep(5)
 
 if __name__ == "__main__":
-    main_loop()
+    import sys, traceback, time, logging
+
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                        format='[%(asctime)s] %(levelname)s: %(message)s')
+
+    while True:
+        try:
+            logging.info("Starting SUI_TrapBot main loop...")
+            main_loop()
+        except Exception as e:
+            logging.error(f"Uncaught exception: {e}")
+            traceback.print_exc()
+            logging.info("Retrying after 10 seconds...")
+            time.sleep(10)
