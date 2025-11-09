@@ -12,6 +12,7 @@ import pandas as pd
 import plotly.express as px
 from sqlalchemy import create_engine, text
 import streamlit as st
+from pathlib import Path
 
 # Optional small autorefresh helper:
 # If you include "streamlit-autorefresh" in requirements, uncomment below line.
@@ -21,7 +22,9 @@ try:
 except Exception:
     AUTORELOAD_AVAILABLE = False
 
-# Page config + CSS compact
+# --- DEPLOY HELPERS / CONFIG ---
+BASE_DIR = Path(__file__).resolve().parent
+
 st.set_page_config(page_title="SUI TrapBot Dashboard", layout="wide")
 st.markdown("""
 <style>
@@ -46,11 +49,16 @@ if not db_url:
     st.error("❌ DATABASE_URL chưa thiết lập. Vào Railway → Postgres → Credentials → copy DATABASE_URL và thêm vào Variables của service dashboard.")
     st.stop()
 
-# create engine
+# SQLAlchemy sometimes needs 'postgresql://' instead of 'postgres://'
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+# create engine (lightweight)
 try:
+    # connect_args left empty; add ssl or timeout if your DB requires
     engine = create_engine(db_url, connect_args={})
 except Exception as e:
-    st.error(f"Không thể kết nối DB: {e}")
+    st.error(f"Không thể tạo engine DB: {e}")
     st.stop()
 
 # --- Helper: detect table existence & sample load ---
@@ -64,21 +72,31 @@ def list_tables():
         with engine.connect() as conn:
             res = conn.execute(text(q))
             return [r[0] for r in res.fetchall()]
-    except Exception as e:
+    except Exception:
         return []
 
-def load_latest(table_name="trapbot_data", limit=200):
+# cache the loaded dataframe to reduce DB load
+# cache keyed by (table_name, limit, cache_bust)
+@st.cache_data(ttl=10)  # short TTL; tune as needed
+def load_latest(table_name="trapbot_data", limit=200, cache_bust: int = 0):
     q = f"SELECT * FROM {table_name} ORDER BY timestamp DESC LIMIT {limit}"
     try:
         df = pd.read_sql(q, engine)
         if not df.empty:
             # timestamp UTC -> VN (Asia/Bangkok)
+            # pd.to_datetime(..., utc=True) will localize naive to UTC
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Asia/Bangkok")
             df = df.sort_values("timestamp")
         return df
     except Exception as e:
-        st.warning(f"Lỗi khi đọc bảng {table_name}: {e}")
+        # return empty df on error; UI will show warning
         return pd.DataFrame()
+
+# Ensure session_state keys
+if "detected_tables" not in st.session_state:
+    st.session_state["detected_tables"] = None
+if "cache_bust" not in st.session_state:
+    st.session_state["cache_bust"] = 0
 
 # --- Sidebar controls ---
 with st.sidebar:
@@ -89,16 +107,18 @@ with st.sidebar:
         st.experimental_rerun()
 
     if st.button("Refresh data"):
+        # bump cache_bust to force cache refresh
+        st.session_state["cache_bust"] = st.session_state.get("cache_bust", 0) + 1
         st.experimental_rerun()
 
     st.write("---")
     st.info("Trigger retrain: an toàn — chỉ hiển thị SQL để bạn chạy thủ công (không ghi tự động).")
     if st.button("Trigger retrain (show SQL)"):
-        now = pd.Timestamp.utcnow().tz_convert("UTC")
+        # show example SQL only
         sql = (
             "-- SQL mẫu: INSERT into trapbot_commands to request retrain\n"
             "INSERT INTO trapbot_commands(command, created_at, payload)\n"
-            f"VALUES ('retrain', now(), '{{\"reason\": \"manual trigger from dashboard\"}}');"
+            "VALUES ('retrain', now(), '{\"reason\": \"manual trigger from dashboard\"}');"
         )
         st.code(sql, language="sql")
         st.success("SQL hiển thị ở trên. Chạy thủ công trong psql hoặc tool DB nếu muốn thực hiện.")
@@ -119,24 +139,36 @@ with col_limit:
 if tables:
     st.write("Detected tables:", ", ".join(tables))
 
-# --- Load data ---
-df = load_latest(table_name, limit=nrows)
+# --- Load data (use cache_bust to force reload when requested) ---
+df = load_latest(table_name, limit=nrows, cache_bust=st.session_state.get("cache_bust", 0))
 
 # --- Top metrics ---
 if not df.empty:
     last = df.iloc[-1]
     col1, col2, col3 = st.columns([3,1,1])
-    col1.metric("Price (last)", f"{last.get('price', last.get('price', 0)):.6f}")
+    price_val = last.get('price', 0)
+    try:
+        col1.metric("Price (last)", f"{float(price_val):.6f}")
+    except Exception:
+        col1.metric("Price (last)", f"{price_val}")
+
     # funding column name maybe 'funding' or 'funding_pct' — try both
     funding_val = None
     for key in ("funding", "funding_pct", "fund_rate"):
         if key in df.columns:
             funding_val = last.get(key)
             break
-    funding_text = f"{funding_val:.6f}%" if funding_val is not None else "n/a"
+    if funding_val is not None:
+        try:
+            funding_text = f"{float(funding_val):.6f}%"
+        except Exception:
+            funding_text = str(funding_val)
+    else:
+        funding_text = "n/a"
     col2.metric("Funding (%)", funding_text)
+
     oi_val = last.get("oi") if "oi" in df.columns else last.get("open_interest", None)
-    oi_text = f"{int(oi_val):,}" if oi_val is not None else "n/a"
+    oi_text = f"{int(oi_val):,}" if (oi_val is not None and pd.notna(oi_val)) else "n/a"
     col3.metric("Open Interest", oi_text)
 else:
     st.warning("Chưa có dữ liệu trong bảng hoặc không thể đọc bảng.")
