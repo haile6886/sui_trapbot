@@ -14,8 +14,7 @@ from sqlalchemy import create_engine, text
 import streamlit as st
 from pathlib import Path
 
-# Optional small autorefresh helper:
-# If you include "streamlit-autorefresh" in requirements, uncomment below line.
+# Optional small autorefresh helper
 try:
     from streamlit_autorefresh import st_autorefresh
     AUTORELOAD_AVAILABLE = True
@@ -55,7 +54,6 @@ if db_url.startswith("postgres://"):
 
 # create engine (lightweight)
 try:
-    # connect_args left empty; add ssl or timeout if your DB requires
     engine = create_engine(db_url, connect_args={"sslmode": "require"})
 except Exception as e:
     st.error(f"Không thể tạo engine DB: {e}")
@@ -76,23 +74,20 @@ def list_tables():
         return []
 
 # cache the loaded dataframe to reduce DB load
-# cache keyed by (table_name, limit, cache_bust)
-@st.cache_data(ttl=10)  # short TTL; tune as needed
+@st.cache_data(ttl=10)  # short TTL
 def load_latest(table_name="trapbot_data", limit=200, cache_bust: int = 0):
-    q = f"SELECT * FROM {table_name} ORDER BY timestamp DESC LIMIT {limit}"
+    q = text(f"SELECT * FROM public.{table_name} ORDER BY timestamp DESC LIMIT {limit}")
     try:
-        df = pd.read_sql(q, engine)
+        with engine.connect() as conn:
+            df = pd.read_sql(q, conn)
         if not df.empty:
-            # timestamp UTC -> VN (Asia/Bangkok)
-            # pd.to_datetime(..., utc=True) will localize naive to UTC
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Asia/Bangkok")
             df = df.sort_values("timestamp")
         return df
-    except Exception as e:
-        # return empty df on error; UI will show warning
+    except Exception:
         return pd.DataFrame()
 
-# Ensure session_state keys
+# --- Session state ---
 if "detected_tables" not in st.session_state:
     st.session_state["detected_tables"] = None
 if "cache_bust" not in st.session_state:
@@ -101,32 +96,32 @@ if "cache_bust" not in st.session_state:
 # --- Sidebar controls ---
 with st.sidebar:
     st.header("Controls")
+
     if st.button("Detect table automatically"):
         tables = list_tables()
         st.session_state["detected_tables"] = tables
         st.rerun()
 
     if st.button("Refresh data"):
-        # bump cache_bust to force cache refresh
-        st.session_state["cache_bust"] = st.session_state.get("cache_bust", 0) + 1
+        st.session_state["cache_bust"] += 1
         st.rerun()
 
     st.write("---")
     st.info("Trigger retrain: an toàn — chỉ hiển thị SQL để bạn chạy thủ công (không ghi tự động).")
+
     if st.button("Trigger retrain (show SQL)"):
-        # show example SQL only
         sql = (
-            "-- SQL mẫu: INSERT into trapbot_commands to request retrain\n"
+            "-- SQL mẫu: INSERT vào trapbot_commands để yêu cầu retrain\n"
             "INSERT INTO trapbot_commands(command, created_at, payload)\n"
             "VALUES ('retrain', now(), '{\"reason\": \"manual trigger from dashboard\"}');"
         )
         st.code(sql, language="sql")
-        st.success("SQL hiển thị ở trên. Chạy thủ công trong psql hoặc tool DB nếu muốn thực hiện.")
+        st.success("SQL hiển thị ở trên. Chạy thủ công trong psql hoặc công cụ DB nếu muốn thực hiện.")
 
     st.write("---")
-    st.caption("Note: dashboard đọc dữ liệu, không thay đổi bot.")
+    st.caption("Note: dashboard chỉ đọc dữ liệu, không thay đổi bot.")
 
-# --- Main area: choose table ---
+# --- Main area ---
 default_table = "trapbot_data"
 tables = st.session_state.get("detected_tables", None)
 col_table, col_limit = st.columns([3,1])
@@ -135,78 +130,64 @@ with col_table:
 with col_limit:
     nrows = st.number_input("Rows", min_value=50, max_value=2000, value=300, step=50)
 
-# if we detected tables earlier, show them
 if tables:
     st.write("Detected tables:", ", ".join(tables))
 
-# --- Load data (use cache_bust to force reload when requested) ---
-df = load_latest(table_name, limit=nrows, cache_bust=st.session_state.get("cache_bust", 0))
+# --- Load data ---
+df = load_latest(table_name, limit=nrows, cache_bust=st.session_state["cache_bust"])
 
-# --- Top metrics ---
+# --- Metrics ---
 if not df.empty:
     last = df.iloc[-1]
     col1, col2, col3 = st.columns([3,1,1])
-    price_val = last.get('price', 0)
-    try:
-        col1.metric("Price (last)", f"{float(price_val):.6f}")
-    except Exception:
-        col1.metric("Price (last)", f"{price_val}")
 
-    # funding column name maybe 'funding' or 'funding_pct' — try both
+    # Price
+    try:
+        col1.metric("Price (last)", f"{float(last.get('price', 0)):.6f}")
+    except Exception:
+        col1.metric("Price (last)", str(last.get("price", "n/a")))
+
+    # Funding
     funding_val = None
     for key in ("funding", "funding_pct", "fund_rate"):
         if key in df.columns:
             funding_val = last.get(key)
             break
-    if funding_val is not None:
-        try:
-            funding_text = f"{float(funding_val):.6f}%"
-        except Exception:
-            funding_text = str(funding_val)
-    else:
-        funding_text = "n/a"
+    funding_text = f"{float(funding_val):.6f}%" if funding_val is not None else "n/a"
     col2.metric("Funding (%)", funding_text)
 
+    # OI
     oi_val = last.get("oi") if "oi" in df.columns else last.get("open_interest", None)
     oi_text = f"{int(oi_val):,}" if (oi_val is not None and pd.notna(oi_val)) else "n/a"
     col3.metric("Open Interest", oi_text)
 else:
     st.warning("Chưa có dữ liệu trong bảng hoặc không thể đọc bảng.")
 
-# --- Compact charts (single column) ---
+# --- Charts ---
 st.markdown("---")
 st.subheader("Price / Funding / OI (recent)")
+
 if not df.empty:
-    # Normalize column names for plotting
     if "timestamp" not in df.columns:
         st.error("Không tìm thấy cột 'timestamp' trong bảng.")
     else:
-        # price
         if "price" in df.columns:
             fig_price = px.line(df, x="timestamp", y="price", title="Price", height=280)
             st.plotly_chart(fig_price, use_container_width=True)
-        # funding
-        funding_col = None
-        for c in ("funding_pct","funding","fund_rate"):
-            if c in df.columns:
-                funding_col = c
-                break
+
+        funding_col = next((c for c in ("funding_pct", "funding", "fund_rate") if c in df.columns), None)
         if funding_col:
             fig_f = px.line(df, x="timestamp", y=funding_col, title="Funding (%)", height=220)
             st.plotly_chart(fig_f, use_container_width=True)
-        # OI
-        oi_col = None
-        for c in ("oi","open_interest"):
-            if c in df.columns:
-                oi_col = c
-                break
+
+        oi_col = next((c for c in ("oi", "open_interest") if c in df.columns), None)
         if oi_col:
             fig_oi = px.line(df, x="timestamp", y=oi_col, title="Open Interest", height=220)
             st.plotly_chart(fig_oi, use_container_width=True)
 else:
     st.info("Đang chờ bot ghi dữ liệu vào bảng. Kiểm tra tên bảng hoặc chờ vài phút.")
 
-# --- Info & troubleshooting ---
+# --- Info ---
 st.markdown("---")
 st.markdown("**Info / Troubleshoot**")
 st.write(f"- DB host (detected): `{engine.url}`")
