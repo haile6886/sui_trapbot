@@ -575,7 +575,8 @@ def main_loop():
             price, funding, oi = get_market(SYMBOL)
             if price is None:
                 logging.warning("[WARN] Market fetch returned None; sleeping")
-                time.sleep(max(1, INTERVAL)); continue
+                time.sleep(max(1, INTERVAL))
+                continue
             ts = now_vn()
             append_data_log(ts, price, funding, oi, path=DATA_LOG_FILE)
 
@@ -593,8 +594,8 @@ def main_loop():
             # compute z-scores for message building (protected)
             z_vals = {"funding": 0.0, "oi": 0.0, "price": 0.0}
             if stats:
-                z_vals["funding"] = (funding - stats.get("fm",0.0)) / max(stats.get("fs", EPS), EPS)
-                z_vals["oi"] = (oi - stats.get("om",0.0)) / max(stats.get("os", EPS), EPS)
+                z_vals["funding"] = (funding - stats.get("fm", 0.0)) / max(stats.get("fs", EPS), EPS)
+                z_vals["oi"] = (oi - stats.get("om", 0.0)) / max(stats.get("os", EPS), EPS)
                 pv_val = stats.get("pv", EPS) if stats.get("pv", None) is not None else EPS
                 z_vals["price"] = (price - (curr.get("price_prev") or price)) / max(pv_val, EPS)
 
@@ -687,18 +688,24 @@ def main_loop():
             check_follow_up(price, funding, oi, stats)
 
             last_price = price
+
+            # increment counter and keepalive (do this before sleeping)
+            counter += 1
+            if counter % 60 == 0:  # khoảng 10 phút nếu INTERVAL ~10s
+                logging.info("[keepalive] Bot running normally – still alive ✅")
+
             time.sleep(max(1, INTERVAL))
+
         except KeyboardInterrupt:
             logging.info("Interrupted by user. Exiting.")
             break
-                    # keepalive log mỗi 10 phút để Railway không sleep
-        if counter % 60 == 0:  # khoảng 10 phút nếu INTERVAL ~10s
-            logging.info("[keepalive] Bot running normally – still alive ✅")
-        counter += 1
+
         except Exception as e:
             logging.error("[ERR] %s", e)
             logging.error(traceback.format_exc())
+            # small backoff before retrying loop
             time.sleep(5)
+
 
 if __name__ == "__main__":
     import sys, traceback, time, logging
