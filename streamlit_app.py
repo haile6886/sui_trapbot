@@ -104,12 +104,12 @@ with st.sidebar:
     if st.button("Detect table automatically"):
         tables = list_tables()
         st.session_state["detected_tables"] = tables
-        st.experimental_rerun()
+        st.rerun()
 
     if st.button("Refresh data"):
         # bump cache_bust to force cache refresh
         st.session_state["cache_bust"] = st.session_state.get("cache_bust", 0) + 1
-        st.experimental_rerun()
+        st.rerun()
 
     st.write("---")
     st.info("Trigger retrain: an toàn — chỉ hiển thị SQL để bạn chạy thủ công (không ghi tự động).")
