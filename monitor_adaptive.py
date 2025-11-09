@@ -1,66 +1,76 @@
 # monitor_adaptive.py
 """
-SUI TrapBot v5.9 — Full monitor_adaptive (complete)
+SUI TrapBot v5.9 — Full production-ready monitor_adaptive with Pro Tips
 Features:
- - Realtime fetch markPrice, funding, openInterest from Binance futures
- - EWMA-based adaptative thresholds, z-scores, TEI
- - Persist to CSV (local) and optionally to Postgres (trapbot_data)
- - Save/load model state (model_state.json)
- - Telegram notifications with DRY-RUN option
- - Safe flags: WRITE_TO_DB, TELEGRAM_DRY_RUN to avoid unintended actions
- - Many comments and configurable via .env or Railway variables
+ - Fetch Binance futures premiumIndex & openInterest (markPrice, lastFundingRate, openInterest)
+ - EWMA-based realtime stats, adaptive thresholds
+ - FUNDING_SPIKE / OI_SPIKE detection with confirmation counts
+ - Breakout classification: TRUE / FAKE
+ - TEI (Trade Event Index) scoring
+ - Follow-up queue: 15-minute confirmations
+ - Summary reports: 15m & 60m
+ - Persist: local CSV (data_log.csv) and model state JSON (model_state.json)
+ - Optional PostgreSQL write (WRITE_TO_DB flag)
+ - Telegram integration with DRY_RUN flag
+ - Pro Tips: Entry / SL / TP suggestions based on ATR (estimated)
+ - Safe defaults: TELEGRAM_DRY_RUN=true, WRITE_TO_DB=false
+ - Configurable via .env / Railway variables
 """
 import os
 import time
 import csv
 import json
 import math
+import requests
+import datetime as dt
+import statistics
+import warnings
 import logging
 import traceback
-import datetime as dt
 from collections import deque, defaultdict
 
-import requests
+# env
 from dotenv import load_dotenv
 
 # optional DB
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-# -------------------- Load config / env --------------------
+# ------------------ Config / Defaults ------------------
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# General config
+# Env / defaults
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "7"))   # VN = UTC+7
 SYMBOL = os.getenv("SYMBOL", "SUIUSDT")
-INTERVAL = int(os.getenv("INTERVAL_SEC", "60"))     # seconds between cycles
-ADAPT_WINDOW = int(os.getenv("ADAPT_WINDOW", "180")) # number of samples in buffer
-SUMMARY_15M = int(os.getenv("SUMMARY_15M", "15"))
-SUMMARY_60M = int(os.getenv("SUMMARY_60M", "60"))
+INTERVAL = int(os.getenv("INTERVAL_SEC", "60"))        # seconds between cycles
+ADAPT_WINDOW = int(os.getenv("ADAPT_WINDOW", "180"))   # samples for statistics
+SUMMARY_15M = int(os.getenv("SUMMARY_15M", "15"))      # minutes
+SUMMARY_60M = int(os.getenv("SUMMARY_60M", "60"))      # minutes
 VERSION = os.getenv("BOT_VERSION", "v5.9 Smart Follow-Up & Pro Alert+ (VN Full)")
 DATA_LOG_FILE = os.getenv("DATA_LOG_FILE", os.path.join(BASE_DIR, "data_log.csv"))
 MODEL_STATE_FILE = os.getenv("MODEL_STATE_FILE", os.path.join(BASE_DIR, "model_state.json"))
 
-# Safety flags
+# Safety / Behavior flags
 TELEGRAM_DRY_RUN = os.getenv("TELEGRAM_DRY_RUN", "true").lower() in ("1", "true", "yes")
 WRITE_TO_DB = os.getenv("WRITE_TO_DB", "false").lower() in ("1", "true", "yes")
 DB_TABLE_NAME = os.getenv("DB_TABLE_NAME", "trapbot_data")
 
-# Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-# Adaptive params
+# Real-time params
 EWMA_ALPHA = float(os.getenv("EWMA_ALPHA", "0.15"))
-CONFIRM_COUNT = int(os.getenv("CONFIRM_COUNT", "2"))
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "600"))  # seconds
+CONFIRM_COUNT = int(os.getenv("CONFIRM_COUNT", "2"))   # samples needed to confirm spike
+ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "600"))  # seconds between same alert
 EARLY_SIGMA = float(os.getenv("EARLY_SIGMA", "1.5"))
 STRONG_SIGMA = float(os.getenv("STRONG_SIGMA", "2.0"))
 EXTREME_SIGMA = float(os.getenv("EXTREME_SIGMA", "2.8"))
 EPS = 1e-9
 
-# Database
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Database / SQLAlchemy engine
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_ENGINE = None
 if WRITE_TO_DB and DATABASE_URL:
@@ -68,66 +78,106 @@ if WRITE_TO_DB and DATABASE_URL:
         DB_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True)
     except Exception as e:
         DB_ENGINE = None
-        # We'll log later
 
-# Logging setup
-LOGFILE = os.path.join(BASE_DIR, "trapbot_send.log")
+# Logging
+LOG_FILE = os.path.join(BASE_DIR, "trapbot_send.log")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-fh = logging.FileHandler(LOGFILE, encoding="utf-8")
+fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
 fh.setLevel(logging.INFO)
 fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
 logging.getLogger().addHandler(fh)
 
-# -------------------- Utilities --------------------
+# ------------------ Utilities ------------------
 def now_vn():
+    """Return VN formatted string (UTC+TZ_OFFSET)"""
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=TZ_OFFSET)).strftime("%d/%m/%Y %H:%M:%S")
+
+def iso_now_utc():
+    """Return current UTC timestamp ISO (no tz suffix) - suitable for timestamptz insert"""
+    return dt.datetime.utcnow().isoformat()
 
 def ensure_dir_for_file(path):
     d = os.path.dirname(os.path.abspath(path))
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
-# -------------------- Telegram --------------------
+# ------------------ Telegram ------------------
 def tg_send(msg, parse_mode="Markdown"):
+    """Send msg via telegram. If TELEGRAM_DRY_RUN, only preview to log."""
     if TELEGRAM_DRY_RUN:
-        logging.info("[tg][DRY] %s", msg.replace("\n"," | ")[:240])
+        logging.info("[tg][DRY] %s", msg.replace("\n", " | ")[:400])
         return True
-    token = TELEGRAM_BOT_TOKEN
-    chat = TELEGRAM_CHAT_ID
-    if not token or not chat:
-        logging.warning("[tg] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("[tg] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set; skip send")
         return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat, "text": msg, "parse_mode": parse_mode}
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": parse_mode}
     try:
         r = requests.post(url, json=payload, timeout=10)
         logging.info("[tg] HTTP %s | preview: %s", r.status_code, msg.replace("\n"," | ")[:150])
         return r.status_code == 200
     except Exception as e:
         logging.error("[tg] Exception: %s", e)
+        logging.error(traceback.format_exc())
         return False
 
-# -------------------- Data IO --------------------
-def append_data_log(ts_str, price, funding, oi, path=DATA_LOG_FILE):
-    ensure_dir_for_file(path)
+# ------------------ Market data I/O ------------------
+def get_market(symbol=SYMBOL):
+    """Fetch from Binance futures premiumIndex & openInterest"""
+    try:
+        j = requests.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}", timeout=8).json()
+        o = requests.get(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}", timeout=8).json()
+        mark = float(j.get("markPrice", 0))
+        funding_raw = float(j.get("lastFundingRate", 0)) * 100.0  # convert to %
+        oi = float(o.get("openInterest", 0))
+        return mark, funding_raw, oi
+    except Exception as e:
+        logging.warning("[get_market] %s", e)
+        return None, None, None
+
+def append_data_log(ts, price, funding, oi, path=DATA_LOG_FILE):
+    """Append to CSV log for backup / offline analysis"""
     first = not os.path.exists(path)
+    ensure_dir_for_file(path)
     try:
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if first:
                 w.writerow(["ts","price","funding_pct","oi"])
-            w.writerow([ts_str, f"{price:.8f}", f"{funding:.6f}", int(oi)])
+            w.writerow([ts, f"{price:.8f}", f"{funding:.6f}", int(oi)])
     except Exception as e:
         logging.error("[append_data_log] %s", e)
 
+def load_recent(limit, path=DATA_LOG_FILE):
+    """Load recent rows from CSV for local stats if needed"""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= 1:
+            return []
+        data_lines = lines[-(limit+1):] if limit < len(lines) else lines
+        out = []
+        for ln in data_lines[1:]:
+            parts = ln.strip().split(",")
+            try:
+                out.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            except:
+                continue
+        return out
+    except Exception as e:
+        logging.warning("[load_recent] %s", e)
+        return []
+
+# ------------------ DB write (optional) ------------------
 def write_to_db(ts_iso, price, funding, oi):
-    """Insert into Postgres trapbot_data. Requires DB_ENGINE."""
+    """Insert row into Postgres trapbot_data if DB_ENGINE configured."""
     if not DB_ENGINE:
-        logging.warning("[db] No DB engine available, skip write.")
+        logging.debug("[DB] DB_ENGINE not available, skipping write")
         return False
     try:
         with DB_ENGINE.begin() as conn:
-            # use parameterized insert
             q = text(f"""
                 INSERT INTO {DB_TABLE_NAME} (timestamp, price, funding_pct, oi)
                 VALUES (:ts, :price, :funding, :oi)
@@ -142,7 +192,7 @@ def write_to_db(ts_iso, price, funding, oi):
         logging.error("[DB] Exception: %s", e)
         return False
 
-# -------------------- State persistance --------------------
+# ------------------ State persist ------------------
 def load_state(path=MODEL_STATE_FILE):
     if not os.path.exists(path):
         return {
@@ -166,7 +216,7 @@ def save_state(state, path=MODEL_STATE_FILE):
     except Exception as e:
         logging.warning("[save_state] %s", e)
 
-# -------------------- Stats & EWMA --------------------
+# ------------------ Realtime EWMA & Stats ------------------
 _price_buf = deque(maxlen=ADAPT_WINDOW)
 _fund_buf = deque(maxlen=ADAPT_WINDOW)
 _oi_buf = deque(maxlen=ADAPT_WINDOW)
@@ -181,7 +231,9 @@ _alert_counts = defaultdict(int)
 _last_alert_time = defaultdict(lambda: 0.0)
 
 def _update_ewma(new, cur, alpha):
-    return new if cur is None else alpha * new + (1 - alpha) * cur
+    if cur is None:
+        return new
+    return alpha * new + (1 - alpha) * cur
 
 def compute_stats_realtime():
     global _ewma_p, _ewma_f, _ewma_o, _ewma_var_f, _ewma_var_o
@@ -200,6 +252,7 @@ def compute_stats_realtime():
         _ewma_f = _update_ewma(f_list[-1], _ewma_f, EWMA_ALPHA)
         _ewma_o = _update_ewma(o_list[-1], _ewma_o, EWMA_ALPHA)
         _ewma_p = _update_ewma(p_list[-1], _ewma_p, EWMA_ALPHA)
+        # variance EWMA (approx)
         dev_f = (f_list[-1] - _ewma_f)**2
         dev_o = (o_list[-1] - _ewma_o)**2
         if _ewma_var_f is None:
@@ -224,8 +277,9 @@ def record_and_update_buffers(price, funding, oi):
     _oi_buf.append(oi)
     return compute_stats_realtime()
 
-# -------------------- Signal detection --------------------
+# ------------------ Detection ------------------
 def detect_signals_realtime(curr, stats, thresholds):
+    """Return list of (key, zvalue) signals"""
     if not stats:
         return []
     out = []
@@ -266,8 +320,9 @@ def detect_signals_realtime(curr, stats, thresholds):
 def mark_alert_sent(key):
     _last_alert_time[key] = time.time()
 
-# -------------------- Breakout classification & TEI --------------------
+# ------------------ Breakout classification & TEI ------------------
 def detect_breakout_type(curr, stats):
+    """Return 'FAKE', 'TRUE' or None"""
     try:
         if not stats:
             return None
@@ -277,8 +332,10 @@ def detect_breakout_type(curr, stats):
         funding_z = (curr["funding"] - stats.get("fm", 0.0)) / max(stats.get("fs", 0.0), EPS)
         oi_z = (curr["oi"] - stats.get("om", 0.0)) / max(stats.get("os", 0.0), EPS)
 
+        # Fake breakout: funding strong but OI not following + momentum
         if abs(funding_z) > 2.0 and abs(oi_z) < 0.6 and abs(momentum) > 0.6:
             return "FAKE"
+        # True breakout: both funding & OI strongly move + momentum
         if abs(funding_z) > 2.0 and abs(oi_z) > 2.0 and abs(momentum) > 1.0:
             return "TRUE"
     except Exception:
@@ -286,6 +343,7 @@ def detect_breakout_type(curr, stats):
     return None
 
 def compute_tei(curr, stats):
+    """Trade Event Index 0..100"""
     if not stats:
         return 0
     pv = max(stats.get("pv", 0.0), EPS)
@@ -298,7 +356,7 @@ def compute_tei(curr, stats):
     norm = max(0, min(100, norm))
     return int(norm)
 
-# -------------------- Message builder --------------------
+# ------------------ Messaging / Builder ------------------
 def sigma_level(z):
     az = abs(z)
     if az >= EXTREME_SIGMA:
@@ -309,9 +367,31 @@ def sigma_level(z):
         return "SỚM", "🟡"
     return "NHẸ", "⚪"
 
+def fmt_pct(x):
+    try:
+        return f"{x:.4f}%"
+    except:
+        return str(x)
+
 def build_alert_message(kind, curr, stats, z_vals, tei, thresholds):
+    """
+    kind: 'FUNDING_SPIKE' | 'OI_SPIKE' | 'BREAKOUT' | 'FAKE' ...
+    z_vals: dict e.g. {'funding': zf, 'oi': zo, 'price': zp}
+    """
     fm = stats.get("fm", 0.0) if stats else 0.0
     om = stats.get("om", 0.0) if stats else 0.0
+    pv = stats.get("pv", 0.0) if stats else 0.0
+    parts = []
+    header_map = {
+        "FUNDING_SPIKE": "⚠️ CẢNH BÁO FUNDING BẤT THƯỜNG",
+        "OI_SPIKE": "⚠️ CẢNH BÁO OI BẤT THƯỜNG",
+        "BREAKOUT": "🚨 BREAKOUT BẤT THƯỜNG",
+        "BREAKDOWN": "🚨 BREAKDOWN BẤT THƯỜNG",
+        "FAKE": "🕳️ FAKE BREAKOUT (Bẫy)",
+        "SUMMARY_15": "📊 BÁO CÁO 15 PHÚT",
+        "SUMMARY_60": "📊 BÁO CÁO 60 PHÚT"
+    }
+    hdr = header_map.get(kind, "⚠️ CẢNH BÁO")
     price_s = f"{curr['price']:.6f}"
     funding_s = f"{curr['funding']:.6f}%"
     oi_s = f"{int(curr['oi']):,}"
@@ -321,38 +401,110 @@ def build_alert_message(kind, curr, stats, z_vals, tei, thresholds):
     s_f, emoji_f = sigma_level(zf)
     s_o, emoji_o = sigma_level(zo)
     s_p, emoji_p = sigma_level(zp)
+    try:
+        fund_pct = ((curr['funding'] - fm) / (abs(fm)+EPS)) * 100.0 if fm != 0 else (curr['funding']*100.0)
+    except:
+        fund_pct = 0.0
+    try:
+        oi_pct = ((curr['oi'] - om) / (abs(om)+EPS)) * 100.0
+    except:
+        oi_pct = 0.0
 
-    parts = []
-    header_map = {
-        "FUNDING_SPIKE": "⚠️ CẢNH BÁO FUNDING BẤT THƯỜNG",
-        "OI_SPIKE": "⚠️ CẢNH BÁO OI BẤT THƯỜNG",
-        "BREAKOUT": "🚨 BREAKOUT BẤT THƯỜNG",
-        "FAKE": "🕳️ FAKE BREAKOUT (Bẫy)",
-    }
-    hdr = header_map.get(kind, "⚠️ CẢNH BÁO")
-    parts.append(hdr)
+    parts.append(f"{hdr}")
     parts.append(f"📌 TEI: {tei} | Giá: {price_s} | Funding: {funding_s} | OI: {oi_s}")
     parts.append("")
-    parts.append("🔎 Phân tích:")
-    parts.append(f"- Funding: {funding_s} | z = {zf:.2f} ({s_f}) {emoji_f}")
-    parts.append(f"- OI: {oi_s} | z = {zo:.2f} ({s_o}) {emoji_o}")
+    parts.append("🔎 Phân tích chi tiết:")
+    parts.append(f"- Funding: {funding_s} | z = {zf:.2f} ({s_f}) {emoji_f} | Δ so với trung bình ≈ {fund_pct:.1f}%")
+    parts.append(f"- OI: {oi_s} | z = {zo:.2f} ({s_o}) {emoji_o} | Δ so với trung bình ≈ {oi_pct:.2f}%")
     parts.append(f"- Giá: z = {zp:.2f} ({s_p}) {emoji_p}")
     parts.append("")
-    # Interpretations (simplified)
-    if kind in ("FUNDING_SPIKE", "OI_SPIKE", "BREAKOUT", "FAKE"):
-        if zf > 0 and zo > 0:
-            parts.append("-> Dòng tiền xác nhận xu hướng tăng. Ưu tiên Long.")
-        elif zf < 0 and zo > 0:
-            parts.append("-> Dòng tiền hỗ trợ Short.")
-        elif zf > 0 and zo < 0:
-            parts.append("-> Funding tăng nhưng OI giảm -> NGUY CƠ BẪY.")
-        else:
-            parts.append("-> Tín hiệu hỗn hợp, quan sát thêm.")
-    parts.append("")
-    parts.append(f"⏱️ {curr['ts']} (UTC+7)")
-    return "\n".join(parts)
 
-# -------------------- Temp adjustments / adapt thresholds --------------------
+    interpret = []
+    action = []
+    if kind in ("BREAKOUT", "BREAKDOWN", "FUNDING_SPIKE", "OI_SPIKE", "FAKE"):
+        sign_f = zf
+        sign_o = zo
+        sign_p = zp
+        if sign_p > 0 and sign_f > 0 and sign_o > 0:
+            interpret.append("-> Dòng tiền xác nhận xu hướng tăng (Funding tăng + OI tăng).")
+            action.append("Ưu tiên Long theo xu hướng. Chờ retest/pullback để vào lệnh an toàn.")
+        elif sign_p < 0 and sign_f < 0 and sign_o > 0:
+            interpret.append("-> Dòng tiền xác nhận phe Short (giá giảm + OI tăng).")
+            action.append("Ưu tiên Short theo xu hướng. Tránh Long bắt đáy.")
+        elif sign_f > 0 and sign_o < 0:
+            interpret.append("-> Funding tăng nhưng OI không tăng (dòng tiền không xác nhận). Có nguy cơ 'bẫy Long'.")
+            action.append("Tránh mua đuổi. Chờ giá quay đầu rõ ràng rồi mới cân nhắc Short.")
+        elif sign_f < 0 and sign_o < 0 and sign_p < 0:
+            interpret.append("-> Funding âm sâu nhưng OI giảm (Short không xác nhận). Có thể là cú rũ Long.")
+            action.append("Quan sát vùng hỗ trợ; nếu giá hồi chắc có thể cân nhắc Long thăm dò.")
+        else:
+            interpret.append("-> Tín hiệu cần quan sát thêm (hỗn hợp).")
+            action.append("Hạn chế vào lệnh lớn; ưu tiên quan sát 1-2 chu kỳ.")
+    else:
+        interpret.append("-> Báo cáo tóm tắt, theo dõi xu hướng.")
+        action.append("Không hành động gấp; dùng làm thông tin tham khảo.")
+
+    parts.append("\n".join(interpret))
+    parts.append("")
+    parts.append("🔧 Gợi ý hành động:")
+    for a in action:
+        parts.append(f"- {a}")
+    parts.append("")
+
+    # Pro Tips: Entry/SL/TP added at the bottom via append_pro_tips() in caller
+    parts.append(f"⏱️ Thời gian: {curr['ts']} (UTC+7)")
+    msg = "\n".join(parts)
+    return msg
+
+# ------------------ Pro Tips (Entry / SL / TP) ------------------
+def append_pro_tips(msg, curr, stats, kind):
+    """Append Entry / SL / TP suggestions based on ATR-like estimate from _price_buf"""
+    try:
+        prices = list(_price_buf)
+        atr = max(statistics.pstdev(prices) if len(prices) > 1 else 0.001, 0.0001)
+        entry = curr['price']
+        # simple direction: if price < prev => bias short; else long
+        direction = "SHORT" if (curr.get("price_prev") is not None and curr['price'] < curr.get("price_prev")) else "LONG"
+        # protective rounding
+        if kind in ("BREAKOUT", "FUNDING_SPIKE", "OI_SPIKE"):
+            if direction == "SHORT":
+                sl = entry + 1.5 * atr
+                tp1 = entry - 1.0 * atr
+                tp2 = entry - 2.0 * atr
+            else:
+                sl = entry - 1.5 * atr
+                tp1 = entry + 1.0 * atr
+                tp2 = entry + 2.0 * atr
+            msg += ("\n\n📈 Chiến lược gợi ý (Pro Tip):\n"
+                    f"- Entry: {entry:.6f}\n"
+                    f"- Stop-loss: {sl:.6f}\n"
+                    f"- Take-profit 1: {tp1:.6f}\n"
+                    f"- Take-profit 2: {tp2:.6f}\n"
+                    f"- ATR(ước lượng): {atr:.6f}")
+        elif kind == "FAKE":
+            # for fake breakout propose cautious probe
+            sl = entry - 1.0 * atr
+            tp1 = entry + 1.0 * atr
+            tp2 = entry + 2.0 * atr
+            msg += ("\n\n📉 Chiến lược thăm dò (bẫy):\n"
+                    f"- Entry (probe): {entry:.6f}\n"
+                    f"- Stop-loss (chặt): {sl:.6f}\n"
+                    f"- TP1: {tp1:.6f} | TP2: {tp2:.6f}\n"
+                    f"- ATR(ước lượng): {atr:.6f}")
+        else:
+            # general suggestion
+            sl = entry - 1.0 * atr
+            tp1 = entry + 1.0 * atr
+            msg += ("\n\n🔧 Gợi ý thăm dò:\n"
+                    f"- Entry: {entry:.6f}\n"
+                    f"- Stop-loss: {sl:.6f}\n"
+                    f"- TP1: {tp1:.6f}\n"
+                    f"- ATR(ước lượng): {atr:.6f}")
+    except Exception as e:
+        logging.warning("[append_pro_tips] %s", e)
+    return msg
+
+# ------------------ Temp thresholds adjustments ------------------
 def apply_temp_adjustments(state, now_ts):
     to_remove = []
     for k, v in (state.get("temp_adjust_until") or {}).items():
@@ -380,6 +532,7 @@ def merge_thresholds_with_temp(base_th, state, now_ts):
                 th[kk] = vv
     return th
 
+# ------------------ Adaptive base thresholds ------------------
 def adapt_thresholds(stats, prev_state):
     th = {"fund_sigma": 2.25, "oi_sigma": 2.25, "vol_mult": 1.8}
     if not stats:
@@ -399,8 +552,44 @@ def adapt_thresholds(stats, prev_state):
             th[k] = (th[k] + prev.get(k, th[k])) / 2
     return th
 
-# -------------------- Follow-up & pro tips --------------------
-follow_queue = []
+# ------------------ Summaries ------------------
+def make_summary_message(kind, samples, alerts):
+    if not samples:
+        return None
+    prices = [x[0] for x in samples]
+    fundings = [x[1] for x in samples]
+    ois = [x[2] for x in samples]
+    avg_p = statistics.mean(prices)
+    avg_f = statistics.mean(fundings)
+    avg_o = statistics.mean(ois)
+    trend_p = (prices[-1] - prices[0]) / (prices[0] + EPS) * 100.0
+    trend_o = (ois[-1] - ois[0]) / (ois[0] + EPS) * 100.0
+    title = "BÁO CÁO 15 PHÚT" if kind == "15" else "BÁO CÁO 60 PHÚT"
+    msg = [
+        f"📊 {title} — {now_vn()}",
+        f"Giá TB: {avg_p:.6f} | Funding TB: {avg_f:.6f}% | OI TB: {int(avg_o):,}",
+        f"Biến động (start->now): Giá {trend_p:+.2f}% | OI {trend_o:+.2f}%",
+        "",
+        "🔎 Nhận xét nhanh:"
+    ]
+    if trend_p > 0.25 and trend_o > 0.3:
+        msg.append("-> Xu hướng tăng, dòng tiền xác nhận. Ưu tiên Long.")
+    elif trend_p < -0.25 and trend_o > 0.3:
+        msg.append("-> Xu hướng giảm, OI tăng (Short có lực). Ưu tiên Short.")
+    elif abs(trend_p) < 0.15:
+        msg.append("-> Thị trường sideway/giảm biến động. Chờ xu hướng rõ.")
+    else:
+        msg.append("-> Tín hiệu hỗn hợp, quan sát thêm.")
+    msg.append("")
+    msg.append(f"⚡ Alerts (15m/60m): Funding={alerts.get('funding',0)} | OI={alerts.get('oi',0)}")
+    return "\n".join(msg)
+
+def make_summary_message_short(kind, samples, alerts):
+    # Simpler summary variant used in main loop
+    return make_summary_message(kind, samples, alerts)
+
+# ------------------ Follow-up 15m & Pro tips queue ------------------
+follow_queue = []  # list of follow tasks
 
 def add_follow_task(kind, price, oi):
     now_ts = time.time()
@@ -413,78 +602,70 @@ def add_follow_task(kind, price, oi):
     })
 
 def check_follow_up(price, funding, oi, stats):
+    """Check follow_queue each loop; send follow-up if OI/price changes significantly"""
     now_ts = time.time()
     if not follow_queue:
         return
     remaining = []
     for task in follow_queue:
         if now_ts > task["follow_until"]:
+            # expired
             continue
         delta_oi_pct = (oi - task["ref_oi"]) / max(task["ref_oi"], EPS) * 100.0
+        # heuristics
         if delta_oi_pct > 2.0:
-            msg = f"✅ FOLLOW-UP: OI tăng {delta_oi_pct:+.2f}% -> Xác nhận. Ref {task['type']} @ {task['price_entry']:.6f}\n⏱️ {now_vn()}"
+            msg = (f"✅ FOLLOW-UP: OI tăng {delta_oi_pct:+.2f}% sau {int((now_ts-task['time'])/60)} phút.\n"
+                   f"Ref: {task['type']} tại {task['price_entry']:.6f}\n"
+                   f"Đánh giá: Dòng tiền xác nhận tiếp diễn. Theo hướng ban đầu.\n"
+                   f"⏱️ {now_vn()} (UTC+7)")
             tg_send(msg)
-            logging.info("[FOLLOW-UP] %s", msg.replace("\n"," | "))
+            logging.info("[FOLLOW-UP] Confirmed follow-up sent: %s", msg.replace("\n"," | "))
         elif delta_oi_pct < -1.0:
-            msg = f"⚠️ FOLLOW-UP: OI giảm {delta_oi_pct:+.2f}% -> Có thể revert. Ref {task['type']} @ {task['price_entry']:.6f}\n⏱️ {now_vn()}"
+            msg = (f"⚠️ FOLLOW-UP: OI giảm {delta_oi_pct:+.2f}% sau {int((now_ts-task['time'])/60)} phút.\n"
+                   f"Ref: {task['type']} tại {task['price_entry']:.6f}\n"
+                   f"Đánh giá: Dòng tiền giảm, khả năng hồi/false-break. Cân nhắc điều chỉnh lệnh.\n"
+                   f"⏱️ {now_vn()} (UTC+7)")
             tg_send(msg)
-            logging.info("[FOLLOW-UP] %s", msg.replace("\n"," | "))
+            logging.info("[FOLLOW-UP] Rebound follow-up sent")
         else:
             remaining.append(task)
     follow_queue[:] = remaining
 
-# -------------------- Market fetch --------------------
-def get_market(symbol=SYMBOL):
-    try:
-        j = requests.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}", timeout=8).json()
-        o = requests.get(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}", timeout=8).json()
-        mark = float(j.get("markPrice", 0))
-        funding_raw = float(j.get("lastFundingRate", 0)) * 100.0  # %
-        oi = float(o.get("openInterest", 0))
-        return mark, funding_raw, oi
-    except Exception as e:
-        logging.warning("[get_market] %s", e)
-        return None, None, None
-
-# -------------------- Main loop --------------------
+# ------------------ Main loop ------------------
 def main_loop():
-    import statistics  # local import
     state = load_state()
     alerts = {"funding": 0, "oi": 0}
     samples_15m = []
     samples_60m = []
+    counter = 0
     last_price = None
     last_15m = time.time()
     last_60m = time.time()
-    counter = 0
-
     logging.info("[%s] Starting %s - thresholds=%s", now_vn(), VERSION, state.get("thresholds"))
-    tg_send(f"🚀 Bot VI {VERSION} started\n⏰ {now_vn()} (UTC+7)")
+    tg_send(f"🚀 Bot VI {VERSION} đã khởi động | ⏰ {now_vn()} (UTC+7)")
 
     while True:
         try:
             price, funding, oi = get_market(SYMBOL)
             if price is None:
-                logging.warning("[WARN] Market fetch None -> sleep")
+                logging.warning("[WARN] Market fetch returned None; sleeping")
                 time.sleep(max(1, INTERVAL))
                 continue
-
             ts = now_vn()
-            # persist CSV
-            append_data_log(ts, price, funding, oi)
+            # local CSV log
+            append_data_log(ts, price, funding, oi, path=DATA_LOG_FILE)
 
-            # try write to DB if enabled
-            if WRITE_TO_DB and DB_ENGINE:
-                # use UTC timestamp isoformat for DB
-                ts_iso = (dt.datetime.utcnow()).isoformat()  # no tz suffix to let DB interpret as timestamptz
-                okdb = write_to_db(ts_iso, price, funding, oi)
-                if okdb:
-                    logging.info("[DB] [OK] wrote one row")
-            else:
-                if WRITE_TO_DB and not DB_ENGINE:
-                    logging.warning("[DB] WRITE_TO_DB=true but no DB_ENGINE configured (DATABASE_URL missing or invalid)")
+            # optionally write to DB
+            if WRITE_TO_DB:
+                if DB_ENGINE:
+                    ts_iso = iso_now_utc()
+                    ok = write_to_db(ts_iso, price, funding, oi)
+                    if ok:
+                        logging.debug("[DB] wrote row at %s", ts_iso)
+                else:
+                    logging.warning("[DB] WRITE_TO_DB=true but DB_ENGINE not configured (DATABASE_URL missing or invalid)")
 
-            # stats
+            # realtime stats via buffers
             stats = record_and_update_buffers(price, funding, oi) or compute_stats_realtime()
             base_th = adapt_thresholds(stats, state)
             now_ts = time.time()
@@ -492,46 +673,51 @@ def main_loop():
             thresholds = merge_thresholds_with_temp(base_th, state, now_ts)
             state["thresholds"] = thresholds
             state["last_updated"] = ts
-            save_state(state)
+            save_state(state, path=MODEL_STATE_FILE)
 
             curr = {"ts": ts, "price": price, "funding": funding, "oi": oi, "price_prev": last_price}
+            # compute z-scores for building messages
             z_vals = {"funding": 0.0, "oi": 0.0, "price": 0.0}
             if stats:
-                z_vals["funding"] = (funding - stats.get("fm", 0.0)) / max(stats.get("fs", EPS), EPS)
-                z_vals["oi"] = (oi - stats.get("om", 0.0)) / max(stats.get("os", EPS), EPS)
+                z_vals["funding"] = (funding - stats.get("fm",0.0)) / max(stats.get("fs", EPS), EPS)
+                z_vals["oi"] = (oi - stats.get("om",0.0)) / max(stats.get("os", EPS), EPS)
                 pv_val = stats.get("pv", EPS) if stats.get("pv", None) is not None else EPS
                 z_vals["price"] = (price - (curr.get("price_prev") or price)) / max(pv_val, EPS)
 
-            # detect
+            # detect and classify
             signals = detect_signals_realtime(curr, stats, thresholds) if stats else []
             br_type = detect_breakout_type(curr, stats)
             tei = compute_tei(curr, stats)
 
-            # breakout handling
+            # specialized breakout handling
             if br_type == "FAKE":
                 until = int(time.time() + 30*60)
                 set_temp_adjust(state, "reduce_sens_30m", until, {"fund_sigma": max(3.0, thresholds.get("fund_sigma",2.25)), "oi_sigma": max(3.0, thresholds.get("oi_sigma",2.25))})
-                save_state(state)
+                save_state(state, path=MODEL_STATE_FILE)
                 msg = build_alert_message("FAKE", curr, stats or {}, z_vals, tei, thresholds)
+                msg = append_pro_tips(msg, curr, stats or {}, "FAKE")
                 tg_send(msg); logging.info("[FAKE] %s", msg.replace("\n"," | "))
                 add_follow_task("FAKE", price, oi)
             elif br_type == "TRUE":
                 until = int(time.time() + 20*60)
                 set_temp_adjust(state, "increase_watch_20m", until, {"fund_sigma": max(1.2, thresholds.get("fund_sigma",1.5)), "oi_sigma": max(1.2, thresholds.get("oi_sigma",1.5))})
-                save_state(state)
+                save_state(state, path=MODEL_STATE_FILE)
                 msg = build_alert_message("BREAKOUT", curr, stats or {}, z_vals, tei, thresholds)
+                msg = append_pro_tips(msg, curr, stats or {}, "BREAKOUT")
                 tg_send(msg); logging.info("[TRUE] %s", msg.replace("\n"," | "))
                 add_follow_task("BREAKOUT", price, oi)
 
-            # signals
+            # regular signals handling
             if signals:
                 for s in signals:
-                    key, zval = s
+                    key = s[0]
+                    zval = s[1]
                     if time.time() - _last_alert_time[key] < ALERT_COOLDOWN:
-                        logging.debug("[ALERT] Skip %s due cooldown", key)
+                        logging.debug("[ALERT] Skipped %s due cooldown", key)
                         continue
                     msg = build_alert_message(key, curr, stats or {}, z_vals, tei, thresholds)
-                    ok = tg_send(f"🚀 Bot VI {VERSION} - {key}\n" + msg)
+                    msg = append_pro_tips(msg, curr, stats or {}, key)
+                    ok = tg_send(f"🚀 Bot VI {VERSION} - cảnh báo\n" + msg)
                     logging.info("[ALERT] %s | sent=%s", msg.replace("\n"," | "), ok)
                     if ok:
                         mark_alert_sent(key)
@@ -539,15 +725,17 @@ def main_loop():
                         alerts["funding"] += 1
                     if key.startswith("OI"):
                         alerts["oi"] += 1
+                    # add follow-up for major signals
                     if key in ("FUNDING_SPIKE", "OI_SPIKE"):
                         add_follow_task(key, price, oi)
             else:
                 logging.info("[%s] price=%0.6f funding=%0.6f%% oi=%s TEI=%s thresholds=%s",
                              ts, price, funding, f"{int(oi):,}", tei, thresholds)
 
-            # summary windows
+            # add to summary windows
             samples_15m.append((price, funding, oi))
             samples_60m.append((price, funding, oi))
+            # cap sizes
             max_15_samples = max(1, int((SUMMARY_15M*60) / max(1, INTERVAL)))
             max_60_samples = max(1, int((SUMMARY_60M*60) / max(1, INTERVAL)))
             if len(samples_15m) > max_15_samples:
@@ -555,85 +743,61 @@ def main_loop():
             if len(samples_60m) > max_60_samples:
                 samples_60m = samples_60m[-max_60_samples:]
 
-            # time-based reports
+            # time-based reports (15m)
             if time.time() - last_15m >= SUMMARY_15M * 60:
-                msg15 = make_summary_message_short("15", samples_15m, alerts)
+                msg15 = make_summary_message("15", samples_15m, alerts)
                 if msg15:
                     tg_send(msg15)
                     logging.info("[SUMMARY_15] sent")
                 last_15m = time.time()
                 samples_15m = []
 
+            # time-based reports (60m)
             if time.time() - last_60m >= SUMMARY_60M * 60:
-                msg60 = make_summary_message_short("60", samples_60m, alerts)
+                msg60 = make_summary_message("60", samples_60m, alerts)
                 if msg60:
                     tg_send(msg60)
                     logging.info("[SUMMARY_60] sent")
                 last_60m = time.time()
                 samples_60m = []
 
-            # persist recent TEI to state
+            # TEI history persist short
             thist = state.get("tei_history", [])
             thist.append({"ts": ts, "price": price, "tei": tei})
             state["tei_history"] = thist[-500:]
-            save_state(state)
+            save_state(state, path=MODEL_STATE_FILE)
 
-            # follow-up check
+            # check follow-up queue
             check_follow_up(price, funding, oi, stats)
 
             last_price = price
+
+            # increment counter and keepalive logs
             counter += 1
             if counter % 60 == 0:
-                logging.info("[keepalive] Bot still alive")
+                logging.info("[keepalive] Bot running normally – still alive ✅")
 
             time.sleep(max(1, INTERVAL))
-
         except KeyboardInterrupt:
             logging.info("Interrupted by user. Exiting.")
             break
         except Exception as e:
             logging.error("[ERR] %s", e)
             logging.error(traceback.format_exc())
+            # small backoff
             time.sleep(5)
 
-# -------------------- Short summary maker --------------------
-def make_summary_message_short(kind, samples, alerts):
-    if not samples:
-        return None
-    prices = [x[0] for x in samples]
-    fundings = [x[1] for x in samples]
-    ois = [x[2] for x in samples]
-    avg_p = sum(prices)/len(prices)
-    avg_f = sum(fundings)/len(fundings)
-    avg_o = sum(ois)/len(ois)
-    trend_p = (prices[-1] - prices[0]) / (prices[0] + EPS) * 100.0
-    trend_o = (ois[-1] - ois[0]) / (ois[0] + EPS) * 100.0
-    title = "BÁO CÁO 15 PHÚT" if kind == "15" else "BÁO CÁO 60 PHÚT"
-    msg = [
-        f"📊 {title} — {now_vn()}",
-        f"Giá TB: {avg_p:.6f} | Funding TB: {avg_f:.6f}% | OI TB: {int(avg_o):,}",
-        f"Biến động (start->now): Giá {trend_p:+.2f}% | OI {trend_o:+.2f}%",
-        "",
-        "🔎 Nhận xét:"
-    ]
-    if trend_p > 0.25 and trend_o > 0.3:
-        msg.append("-> Xu hướng tăng, dòng tiền xác nhận. Ưu tiên Long.")
-    elif trend_p < -0.25 and trend_o > 0.3:
-        msg.append("-> Xu hướng giảm, OI tăng. Ưu tiên Short.")
-    elif abs(trend_p) < 0.15:
-        msg.append("-> Sideway/low vol.")
-    else:
-        msg.append("-> Tín hiệu hỗn hợp.")
-    msg.append("")
-    msg.append(f"⚡ Alerts (15m/60m): Funding={alerts.get('funding',0)} | OI={alerts.get('oi',0)}")
-    return "\n".join(msg)
-
-# -------------------- Entrypoint --------------------
+# ------------------ Entrypoint ------------------
 if __name__ == "__main__":
-    logging.info("Launching monitor_adaptive.py main...")
-    try:
-        main_loop()
-    except Exception as e:
-        logging.error("Fatal error at top level: %s", e)
-        logging.error(traceback.format_exc())
-        raise
+    import sys
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                        format='[%(asctime)s] %(levelname)s: %(message)s')
+    while True:
+        try:
+            logging.info("Starting SUI_TrapBot main loop...")
+            main_loop()
+        except Exception as e:
+            logging.error(f"Uncaught exception: {e}")
+            traceback.print_exc()
+            logging.info("Retrying after 10 seconds...")
+            time.sleep(10)
