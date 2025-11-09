@@ -56,7 +56,7 @@ if db_url.startswith("postgres://"):
 # create engine (lightweight)
 try:
     # connect_args left empty; add ssl or timeout if your DB requires
-    engine = create_engine(db_url, connect_args={})
+    engine = create_engine(db_url, connect_args={"sslmode": "require"})
 except Exception as e:
     st.error(f"Không thể tạo engine DB: {e}")
     st.stop()
