@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 
 # optional DB
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
 
 # ------------------ Config / Defaults ------------------
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -73,11 +73,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # Database / SQLAlchemy engine
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_ENGINE = None
+# Improved DB connect: retry with short connect_timeout
 if WRITE_TO_DB and DATABASE_URL:
-    try:
-        DB_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True)
-    except Exception as e:
-        DB_ENGINE = None
+    for attempt in range(1, 6):
+        try:
+            DB_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+            # quick test connection
+            with DB_ENGINE.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            logging.info("[DB] Connected to database on attempt %d", attempt)
+            break
+        except OperationalError as oe:
+            logging.warning("[DB] connect attempt %d failed: %s", attempt, oe)
+            DB_ENGINE = None
+            time.sleep(min(5 * attempt, 30))
+        except Exception as e:
+            logging.error("[DB] unexpected error on connect attempt %d: %s", attempt, e)
+            DB_ENGINE = None
+            time.sleep(min(5 * attempt, 30))
 
 # Logging
 LOG_FILE = os.path.join(BASE_DIR, "trapbot_send.log")
@@ -182,7 +195,7 @@ def write_to_db(ts_iso, price, funding, oi, current_price=None):
                 INSERT INTO {DB_TABLE_NAME} (timestamp, price, funding_pct, oi, other_json, current_price)
                 VALUES (:ts, :price, :funding, :oi, :other_json, :current_price)
             """)
-            # create a minimal other_json if you want to store extras (keep compatibility)
+            # minimal other_json kept for compatibility; change if you want to store extras
             other_json = {}
             conn.execute(q, {
                 "ts": ts_iso,
@@ -561,7 +574,7 @@ def adapt_thresholds(stats, prev_state):
             th[k] = (th[k] + prev.get(k, th[k])) / 2
     return th
 
-# ------------------ Summaries ------------------
+# ------------------ Summaries ------------------ (rest unchanged)
 def make_summary_message(kind, samples, alerts):
     if not samples:
         return None
@@ -596,6 +609,15 @@ def make_summary_message(kind, samples, alerts):
 def make_summary_message_short(kind, samples, alerts):
     # Simpler summary variant used in main loop
     return make_summary_message(kind, samples, alerts)
+
+# (rest of code - follow-up queue, main loop, etc.)
+# For brevity this file retains the remainder of your original logic unchanged.
+# The only functional changes are:
+#  - DB_ENGINE creation with retry above
+#  - write_to_db to include current_price and other_json
+#  - main_loop will call write_to_db(..., current_price=price)
+#
+# Below is the remainder of your original main_loop with the single-call change.
 
 # ------------------ Follow-up 15m & Pro tips queue ------------------
 follow_queue = []  # list of follow tasks
@@ -668,7 +690,7 @@ def main_loop():
             if WRITE_TO_DB:
                 if DB_ENGINE:
                     ts_iso = iso_now_utc()
-                    ok = write_to_db(ts_iso, price, funding, oi)
+                    ok = write_to_db(ts_iso, price, funding, oi, current_price=price)
                     if ok:
                         logging.debug("[DB] wrote row at %s", ts_iso)
                 else:
