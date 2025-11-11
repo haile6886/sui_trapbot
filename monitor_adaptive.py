@@ -1,23 +1,12 @@
 # monitor_adaptive.py
 """
-SUI TrapBot v5.9 — Full production-ready monitor_adaptive with Pro Tips
-Features:
- - Fetch Binance futures premiumIndex & openInterest (markPrice, lastFundingRate, openInterest)
- - EWMA-based realtime stats, adaptive thresholds
- - FUNDING_SPIKE / OI_SPIKE detection with confirmation counts
- - Breakout classification: TRUE / FAKE
- - TEI (Trade Event Index) scoring
- - Follow-up queue: 15-minute confirmations
- - Summary reports: 15m & 60m
- - Persist: local CSV (data_log.csv) and model state JSON (model_state.json)
- - Optional PostgreSQL write (WRITE_TO_DB flag)
- - Telegram integration with DRY_RUN flag
- - Pro Tips: Entry / SL / TP suggestions based on ATR (estimated)
- - Safe defaults: TELEGRAM_DRY_RUN=true, WRITE_TO_DB=false
- - Configurable via .env / Railway variables
+SUI TrapBot v5.9 — Full production-ready monitor_adaptive with alert DB writes
+- Ghi dữ liệu thời gian thực vào trapbot_data (nếu WRITE_TO_DB=true)
+- Ghi alerts vào trapbot_alerts để dashboard có thể đọc và hiển thị
+- TEI/SL/TP cải tiến (ATR-based), FAKE/TRUE tính chặt hơn
+- Cấu hình nhiều tham số qua .env
 """
 import os
-import sys
 import time
 import csv
 import json
@@ -29,12 +18,11 @@ import warnings
 import logging
 import traceback
 from collections import deque, defaultdict
-from urllib.parse import urlparse
 
 # env
 from dotenv import load_dotenv
 
-# optional DB
+# optional DB (SQLAlchemy)
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
 
@@ -42,10 +30,6 @@ from sqlalchemy.exc import SQLAlchemyError, OperationalError
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
-
-# Immediate startup print to make sure container/script actually runs (visible in Railway logs)
-print("[DEBUG-START] monitor_adaptive starting", time.time())
-sys.stdout.flush()
 
 # Env / defaults
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "7"))   # VN = UTC+7
@@ -62,6 +46,7 @@ MODEL_STATE_FILE = os.getenv("MODEL_STATE_FILE", os.path.join(BASE_DIR, "model_s
 TELEGRAM_DRY_RUN = os.getenv("TELEGRAM_DRY_RUN", "true").lower() in ("1", "true", "yes")
 WRITE_TO_DB = os.getenv("WRITE_TO_DB", "false").lower() in ("1", "true", "yes")
 DB_TABLE_NAME = os.getenv("DB_TABLE_NAME", "trapbot_data")
+ALERTS_TABLE = os.getenv("ALERTS_TABLE", "trapbot_alerts")  # table to store alerts
 
 # Real-time params
 EWMA_ALPHA = float(os.getenv("EWMA_ALPHA", "0.15"))
@@ -72,6 +57,14 @@ STRONG_SIGMA = float(os.getenv("STRONG_SIGMA", "2.0"))
 EXTREME_SIGMA = float(os.getenv("EXTREME_SIGMA", "2.8"))
 EPS = 1e-9
 
+# Risk sizing / Pro tip tuning (env-configurable)
+MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.0006"))    # tối thiểu Stop-loss (abs)
+MIN_TP_PCT = float(os.getenv("MIN_TP_PCT", "0.0008"))    # tối thiểu TP (abs)
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))     # SL = ATR * x
+ATR_TP1_MULT = float(os.getenv("ATR_TP1_MULT", "1.0"))   # TP1 = ATR * x
+ATR_TP2_MULT = float(os.getenv("ATR_TP2_MULT", "2.0"))   # TP2 = ATR * x
+MAX_SL_PCT = float(os.getenv("MAX_SL_PCT", "0.02"))      # max SL cap (2%)
+
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -79,74 +72,29 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # Database / SQLAlchemy engine
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_ENGINE = None
-
-# ------------------ Improved DB init with retry/backoff ------------------
-def init_db_engine(max_attempts=6, base_delay=2):
-    """
-    Robust initialization of SQLAlchemy engine with retry and connect timeout.
-    Call this at import time (if WRITE_TO_DB) and the main loop will attempt to re-init if needed.
-    """
-    global DB_ENGINE, DATABASE_URL
-    if not DATABASE_URL:
-        logging.warning("[DB] DATABASE_URL not set; DB disabled")
-        return None
-
-    # Log parsed host for debug (visible in Railway logs)
-    try:
-        u = urlparse(DATABASE_URL)
-        logging.info("[DB-DEBUG] Using DATABASE_URL host=%s port=%s db=%s user=%s",
-                     u.hostname, u.port, u.path.lstrip("/"), u.username)
-        print(f"[DB-DEBUG] host={u.hostname} port={u.port} db={u.path.lstrip('/')} user={u.username}")
-        sys.stdout.flush()
-    except Exception as e:
-        logging.warning("[DB-DEBUG] cannot parse DATABASE_URL: %s", e)
-
-    attempt = 0
-    while attempt < max_attempts:
-        attempt += 1
+# Improved DB connect: retry with short connect_timeout
+if WRITE_TO_DB and DATABASE_URL:
+    for attempt in range(1, 7):
         try:
-            eng = create_engine(
-                DATABASE_URL,
-                pool_pre_ping=True,
-                connect_args={"connect_timeout": 10},
-                pool_size=5,
-                max_overflow=5,
-                pool_timeout=10
-            )
+            DB_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
             # quick test connection
-            with eng.connect() as conn:
+            with DB_ENGINE.connect() as conn:
                 conn.execute(text("SELECT 1"))
-            DB_ENGINE = eng
+            logging.basicConfig(level=logging.INFO)
             logging.info("[DB] Connected to database on attempt %d", attempt)
-            print(f"[DB] Connected on attempt {attempt}")
-            sys.stdout.flush()
-            return DB_ENGINE
-        except OperationalError as e:
-            logging.warning("[DB] connect attempt %d failed: %s", attempt, e)
-            print(f"[DB] connect attempt {attempt} failed: {e}")
-            sys.stdout.flush()
+            break
+        except OperationalError as oe:
+            logging.basicConfig(level=logging.WARNING)
+            logging.warning("[DB] connect attempt %d failed: %s", attempt, oe)
             DB_ENGINE = None
-            # exponential backoff with small jitter
-            sleep_for = base_delay * (2 ** (attempt - 1))
-            jitter = min(5, sleep_for * 0.1)
-            time.sleep(sleep_for + (jitter * (0.5 - (attempt % 2))))
+            time.sleep(min(5 * attempt, 30))
         except Exception as e:
+            logging.basicConfig(level=logging.ERROR)
             logging.error("[DB] unexpected error on connect attempt %d: %s", attempt, e)
-            print(f"[DB] unexpected error on connect attempt {attempt}: {e}")
-            sys.stdout.flush()
             DB_ENGINE = None
-            time.sleep(base_delay)
-    logging.warning("[DB] All connection attempts failed; DB disabled for now")
-    print("[DB] All connection attempts failed; DB disabled for now")
-    sys.stdout.flush()
-    DB_ENGINE = None
-    return None
+            time.sleep(min(5 * attempt, 30))
 
-if WRITE_TO_DB:
-    # attempt init at startup
-    init_db_engine()
-
-# ------------------ Logging ------------------
+# Logging (file + stdout)
 LOG_FILE = os.path.join(BASE_DIR, "trapbot_send.log")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
@@ -237,25 +185,19 @@ def load_recent(limit, path=DATA_LOG_FILE):
         logging.warning("[load_recent] %s", e)
         return []
 
-# ------------------ DB write (optional, robust) ------------------
+# ------------------ DB write (optional) ------------------
 def write_to_db(ts_iso, price, funding, oi, current_price=None):
     """Insert row into Postgres trapbot_data if DB_ENGINE configured."""
-    global DB_ENGINE
-    if not WRITE_TO_DB:
-        logging.debug("[DB] WRITE_TO_DB=false; skipping DB write")
+    if not DB_ENGINE:
+        logging.debug("[DB] DB_ENGINE not available, skipping write")
         return False
-    if DB_ENGINE is None:
-        logging.info("[DB] DB_ENGINE not ready, attempting init...")
-        init_db_engine()
-        if DB_ENGINE is None:
-            logging.warning("[DB] DB_ENGINE still None after init; skipping write")
-            return False
     try:
         with DB_ENGINE.begin() as conn:
             q = text(f"""
                 INSERT INTO {DB_TABLE_NAME} (timestamp, price, funding_pct, oi, other_json, current_price)
                 VALUES (:ts, :price, :funding, :oi, :other_json, :current_price)
             """)
+            # minimal other_json kept for compatibility; change if you want to store extras
             other_json = {}
             conn.execute(q, {
                 "ts": ts_iso,
@@ -265,22 +207,47 @@ def write_to_db(ts_iso, price, funding, oi, current_price=None):
                 "other_json": json.dumps(other_json),
                 "current_price": float(current_price) if current_price is not None else None
             })
-        logging.info("[DB] ✅ Insert OK ts=%s price=%.6f", ts_iso, float(price))
+        logging.info("[DB] ✅ Đã ghi dữ liệu vào %s", DB_TABLE_NAME)
         return True
     except SQLAlchemyError as e:
         logging.error("[DB] SQLAlchemyError: %s", e)
-        logging.debug(traceback.format_exc())
-        # If operational error, drop engine so init will re-run next time
-        try:
-            if isinstance(e.__cause__, OperationalError):
-                logging.warning("[DB] OperationalError detected, dropping DB_ENGINE to retry later")
-                DB_ENGINE = None
-        except Exception:
-            pass
         return False
     except Exception as e:
-        logging.error("[DB] Exception during insert: %s", e)
-        logging.debug(traceback.format_exc())
+        logging.error("[DB] Exception: %s", e)
+        return False
+
+# ------------------ Alert write ------------------
+def write_alert_to_db(ts_iso, kind, message, tei=None, price=None, funding=None, oi=None, z_vals=None, meta=None):
+    """
+    Ghi một alert vào bảng ALERTS_TABLE (trapbot_alerts).
+    Không gây lỗi nếu DB không khả dụng — chỉ log.
+    """
+    if not DB_ENGINE:
+        logging.debug("[ALERT-DB] DB_ENGINE not available, skipping alert write")
+        return False
+    try:
+        with DB_ENGINE.begin() as conn:
+            q = text(f"""
+                INSERT INTO {ALERTS_TABLE}
+                  (ts, kind, message, tei, price, funding_pct, oi, z_vals, meta)
+                VALUES
+                  (:ts, :kind, :message, :tei, :price, :funding, :oi, :z_vals, :meta)
+            """)
+            conn.execute(q, {
+                "ts": ts_iso,
+                "kind": kind,
+                "message": message,
+                "tei": int(tei) if tei is not None else None,
+                "price": float(price) if price is not None else None,
+                "funding": float(funding) if funding is not None else None,
+                "oi": int(oi) if oi is not None else None,
+                "z_vals": json.dumps(z_vals or {}),
+                "meta": json.dumps(meta or {})
+            })
+        logging.info("[ALERT-DB] wrote alert kind=%s at %s", kind, ts_iso)
+        return True
+    except Exception as e:
+        logging.error("[ALERT-DB] failed to write alert: %s", e)
         return False
 
 # ------------------ State persist ------------------
@@ -413,7 +380,7 @@ def mark_alert_sent(key):
 
 # ------------------ Breakout classification & TEI ------------------
 def detect_breakout_type(curr, stats):
-    """Return 'FAKE', 'TRUE' or None"""
+    """Return 'FAKE', 'TRUE' or None (tối ưu: require OI confirmation cho TRUE)"""
     try:
         if not stats:
             return None
@@ -423,18 +390,19 @@ def detect_breakout_type(curr, stats):
         funding_z = (curr["funding"] - stats.get("fm", 0.0)) / max(stats.get("fs", 0.0), EPS)
         oi_z = (curr["oi"] - stats.get("om", 0.0)) / max(stats.get("os", 0.0), EPS)
 
-        # Fake breakout: funding strong but OI not following + momentum
-        if abs(funding_z) > 2.0 and abs(oi_z) < 0.6 and abs(momentum) > 0.6:
+        # FAKE: funding strong but OI not following + price momentum inconsistent
+        if abs(funding_z) > 2.0 and abs(oi_z) < 0.8 and abs(momentum) > 0.6:
             return "FAKE"
-        # True breakout: both funding & OI strongly move + momentum
-        if abs(funding_z) > 2.0 and abs(oi_z) > 2.0 and abs(momentum) > 1.0:
+
+        # TRUE: both funding & OI strongly move same direction AND momentum supports it
+        if abs(funding_z) > 2.2 and abs(oi_z) > 2.2 and abs(momentum) > 1.0 and (funding_z * oi_z) > 0:
             return "TRUE"
     except Exception:
         return None
     return None
 
 def compute_tei(curr, stats):
-    """Trade Event Index 0..100"""
+    """Trade Event Index 0..100 - điều chỉnh trọng số để OI có tiếng nói mạnh hơn"""
     if not stats:
         return 0
     pv = max(stats.get("pv", 0.0), EPS)
@@ -442,8 +410,15 @@ def compute_tei(curr, stats):
     oi_z = (curr["oi"] - stats.get("om", 0.0)) / max(stats.get("os", 0.0), EPS)
     prev_price = curr.get("price_prev") or curr["price"]
     momentum = (curr["price"] - prev_price) / pv if pv>0 else 0.0
-    score = 0.5 * funding_z + 0.7 * oi_z + 0.6 * momentum
-    norm = 50 + score * 10
+
+    # new weights: ưu tiên OI (dòng tiền), funding là tín hiệu hỗ trợ
+    w_f = 0.4
+    w_o = 0.8
+    w_m = 0.6
+    score = w_f * funding_z + w_o * oi_z + w_m * momentum
+
+    # normalize to 0..100 but compress extremes a bit (tăng robustness)
+    norm = 50 + score * 8.0
     norm = max(0, min(100, norm))
     return int(norm)
 
@@ -504,7 +479,6 @@ def build_alert_message(kind, curr, stats, z_vals, tei, thresholds):
     parts.append(f"{hdr}")
     parts.append(f"📌 TEI: {tei} | Giá: {price_s} | Funding: {funding_s} | OI: {oi_s}")
     parts.append("")
-
     parts.append("🔎 Phân tích chi tiết:")
     parts.append(f"- Funding: {funding_s} | z = {zf:.2f} ({s_f}) {emoji_f} | Δ so với trung bình ≈ {fund_pct:.1f}%")
     parts.append(f"- OI: {oi_s} | z = {zo:.2f} ({s_o}) {emoji_o} | Δ so với trung bình ≈ {oi_pct:.2f}%")
@@ -525,7 +499,7 @@ def build_alert_message(kind, curr, stats, z_vals, tei, thresholds):
             action.append("Ưu tiên Short theo xu hướng. Tránh Long bắt đáy.")
         elif sign_f > 0 and sign_o < 0:
             interpret.append("-> Funding tăng nhưng OI không tăng (dòng tiền không xác nhận). Có nguy cơ 'bẫy Long'.")
-            action.append("Tránh mua đuổi. Chờ giá quay đầu rõ ràng rồi mới cân nhắc Short.")
+            action.append("Tránh mua đuổi. Chờ OI xác nhận trước khi vào lệnh lớn.")
         elif sign_f < 0 and sign_o < 0 and sign_p < 0:
             interpret.append("-> Funding âm sâu nhưng OI giảm (Short không xác nhận). Có thể là cú rũ Long.")
             action.append("Quan sát vùng hỗ trợ; nếu giá hồi chắc có thể cân nhắc Long thăm dò.")
@@ -550,48 +524,59 @@ def build_alert_message(kind, curr, stats, z_vals, tei, thresholds):
 
 # ------------------ Pro Tips (Entry / SL / TP) ------------------
 def append_pro_tips(msg, curr, stats, kind):
-    """Append Entry / SL / TP suggestions based on ATR-like estimate from _price_buf"""
+    """Append Entry / SL / TP suggestions based on ATR-like estimate from _price_buf
+       Cải tiến: dùng ATR, áp min/max SL/TP, kiểm tra xác nhận OI vs Funding."""
     try:
         prices = list(_price_buf)
-        atr = max(statistics.pstdev(prices) if len(prices) > 1 else 0.001, 0.0001)
+        atr = max(statistics.pstdev(prices) if len(prices) > 1 else 0.0005, 0.0001)
+
         entry = curr['price']
-        # simple direction: if price < prev => bias short; else long
-        direction = "SHORT" if (curr.get("price_prev") is not None and curr['price'] < curr.get("price_prev")) else "LONG"
-        # protective rounding
-        if kind in ("BREAKOUT", "FUNDING_SPIKE", "OI_SPIKE"):
-            if direction == "SHORT":
-                sl = entry + 1.5 * atr
-                tp1 = entry - 1.0 * atr
-                tp2 = entry - 2.0 * atr
-            else:
-                sl = entry - 1.5 * atr
-                tp1 = entry + 1.0 * atr
-                tp2 = entry + 2.0 * atr
-            msg += ("\n\n📈 Chiến lược gợi ý (Pro Tip):\n"
-                    f"- Entry: {entry:.6f}\n"
-                    f"- Stop-loss: {sl:.6f}\n"
-                    f"- Take-profit 1: {tp1:.6f}\n"
-                    f"- Take-profit 2: {tp2:.6f}\n"
-                    f"- ATR(ước lượng): {atr:.6f}")
-        elif kind == "FAKE":
-            # for fake breakout propose cautious probe
-            sl = entry - 1.0 * atr
-            tp1 = entry + 1.0 * atr
-            tp2 = entry + 2.0 * atr
-            msg += ("\n\n📉 Chiến lược thăm dò (bẫy):\n"
-                    f"- Entry (probe): {entry:.6f}\n"
-                    f"- Stop-loss (chặt): {sl:.6f}\n"
-                    f"- TP1: {tp1:.6f} | TP2: {tp2:.6f}\n"
-                    f"- ATR(ước lượng): {atr:.6f}")
+        prev = curr.get("price_prev")
+        direction = "SHORT" if (prev is not None and entry < prev) else "LONG"
+
+        sl_distance = ATR_SL_MULT * atr
+        tp1_distance = ATR_TP1_MULT * atr
+        tp2_distance = ATR_TP2_MULT * atr
+
+        sl_distance = max(sl_distance, MIN_SL_PCT)
+        tp1_distance = max(tp1_distance, MIN_TP_PCT)
+        tp2_distance = max(tp2_distance, MIN_TP_PCT * 2)
+
+        sl_distance = min(sl_distance, MAX_SL_PCT)
+
+        funding_z = 0.0
+        oi_z = 0.0
+        if stats:
+            funding_z = (curr['funding'] - stats.get("fm", 0.0)) / max(stats.get("fs", EPS), EPS)
+            oi_z = (curr['oi'] - stats.get("om", 0.0)) / max(stats.get("os", EPS), EPS)
+
+        divergence = (funding_z * oi_z) < 0
+        caution_factor = 1.0
+        if kind == "FAKE" or divergence:
+            caution_factor = 1.4
+            sl_distance *= caution_factor
+            tp1_distance /= caution_factor
+            tp2_distance /= (caution_factor * 1.2)
+
+        if direction == "SHORT":
+            sl = entry + sl_distance
+            tp1 = entry - tp1_distance
+            tp2 = entry - tp2_distance
         else:
-            # general suggestion
-            sl = entry - 1.0 * atr
-            tp1 = entry + 1.0 * atr
-            msg += ("\n\n🔧 Gợi ý thăm dò:\n"
-                    f"- Entry: {entry:.6f}\n"
-                    f"- Stop-loss: {sl:.6f}\n"
-                    f"- TP1: {tp1:.6f}\n"
-                    f"- ATR(ước lượng): {atr:.6f}")
+            sl = entry - sl_distance
+            tp1 = entry + tp1_distance
+            tp2 = entry + tp2_distance
+
+        msg += ("\n\n📈 Chiến lược gợi ý (Pro Tip):\n"
+                f"- Entry: {entry:.6f}\n"
+                f"- Stop-loss: {sl:.6f}  (khoảng {sl_distance:.6f} từ entry)\n"
+                f"- Take-profit 1: {tp1:.6f}  (khoảng {tp1_distance:.6f})\n"
+                f"- Take-profit 2: {tp2:.6f}  (khoảng {tp2_distance:.6f})\n"
+                f"- ATR(ước lượng): {atr:.6f}\n")
+        if divergence:
+            msg += ("\n⚠️ Lưu ý: Funding và OI trái chiều (có thể là bẫy). Giảm kích thước lệnh hoặc chờ xác nhận OI.\n")
+        elif kind == "FAKE":
+            msg += ("\n⚠️ Lưu ý: Phát hiện FAKE breakout — ưu tiên quan sát, chỉ probe nhẹ nếu có plan rõ.\n")
     except Exception as e:
         logging.warning("[append_pro_tips] %s", e)
     return msg
@@ -677,7 +662,6 @@ def make_summary_message(kind, samples, alerts):
     return "\n".join(msg)
 
 def make_summary_message_short(kind, samples, alerts):
-    # Simpler summary variant used in main loop
     return make_summary_message(kind, samples, alerts)
 
 # ------------------ Follow-up 15m & Pro tips queue ------------------
@@ -710,15 +694,25 @@ def check_follow_up(price, funding, oi, stats):
                    f"Ref: {task['type']} tại {task['price_entry']:.6f}\n"
                    f"Đánh giá: Dòng tiền xác nhận tiếp diễn. Theo hướng ban đầu.\n"
                    f"⏱️ {now_vn()} (UTC+7)")
-            tg_send(msg)
+            ok = tg_send(msg)
             logging.info("[FOLLOW-UP] Confirmed follow-up sent: %s", msg.replace("\n"," | "))
+            try:
+                ts_iso = iso_now_utc()
+                write_alert_to_db(ts_iso, "FOLLOW_UP_CONFIRMED", msg, price=task['price_entry'], oi=oi, funding=funding, z_vals={})
+            except Exception as e:
+                logging.warning("[FOLLOW-UP] failed to write follow-up to DB: %s", e)
         elif delta_oi_pct < -1.0:
             msg = (f"⚠️ FOLLOW-UP: OI giảm {delta_oi_pct:+.2f}% sau {int((now_ts-task['time'])/60)} phút.\n"
                    f"Ref: {task['type']} tại {task['price_entry']:.6f}\n"
                    f"Đánh giá: Dòng tiền giảm, khả năng hồi/false-break. Cân nhắc điều chỉnh lệnh.\n"
                    f"⏱️ {now_vn()} (UTC+7)")
-            tg_send(msg)
+            ok = tg_send(msg)
             logging.info("[FOLLOW-UP] Rebound follow-up sent")
+            try:
+                ts_iso = iso_now_utc()
+                write_alert_to_db(ts_iso, "FOLLOW_UP_REBOUND", msg, price=task['price_entry'], oi=oi, funding=funding, z_vals={})
+            except Exception as e:
+                logging.warning("[FOLLOW-UP] failed to write follow-up to DB: %s", e)
         else:
             remaining.append(task)
     follow_queue[:] = remaining
@@ -734,7 +728,14 @@ def main_loop():
     last_15m = time.time()
     last_60m = time.time()
     logging.info("[%s] Starting %s - thresholds=%s", now_vn(), VERSION, state.get("thresholds"))
-    tg_send(f"🚀 Bot VI {VERSION} đã khởi động | ⏰ {now_vn()} (UTC+7)")
+    # startup notification
+    startup_msg = f"🚀 Bot VI {VERSION} đã khởi động | ⏰ {now_vn()} (UTC+7)"
+    tg_send(startup_msg)
+    try:
+        ts_iso = iso_now_utc()
+        write_alert_to_db(ts_iso, "BOT_START", startup_msg, meta={"note":"startup"})
+    except Exception as e:
+        logging.debug("[STARTUP] alert write failed: %s", e)
 
     while True:
         try:
@@ -747,12 +748,15 @@ def main_loop():
             # local CSV log
             append_data_log(ts, price, funding, oi, path=DATA_LOG_FILE)
 
-            # optionally write to DB
+            # optionally write to DB (trapbot_data)
             if WRITE_TO_DB:
-                ts_iso = iso_now_utc()
-                ok = write_to_db(ts_iso, price, funding, oi, current_price=price)
-                if ok:
-                    logging.debug("[DB] wrote row at %s", ts_iso)
+                if DB_ENGINE:
+                    ts_iso = iso_now_utc()
+                    ok = write_to_db(ts_iso, price, funding, oi, current_price=price)
+                    if ok:
+                        logging.debug("[DB] wrote row at %s", ts_iso)
+                else:
+                    logging.warning("[DB] WRITE_TO_DB=true but DB_ENGINE not configured (DATABASE_URL missing or invalid)")
 
             # realtime stats via buffers
             stats = record_and_update_buffers(price, funding, oi) or compute_stats_realtime()
@@ -785,7 +789,14 @@ def main_loop():
                 save_state(state, path=MODEL_STATE_FILE)
                 msg = build_alert_message("FAKE", curr, stats or {}, z_vals, tei, thresholds)
                 msg = append_pro_tips(msg, curr, stats or {}, "FAKE")
-                tg_send(msg); logging.info("[FAKE] %s", msg.replace("\n"," | "))
+                ok = tg_send(msg)
+                logging.info("[FAKE] %s", msg.replace("\n"," | "))
+                # write alert to DB
+                try:
+                    ts_iso = iso_now_utc()
+                    write_alert_to_db(ts_iso, "FAKE", msg, tei=tei, price=price, funding=funding, oi=oi, z_vals=z_vals, meta={"sent": ok})
+                except Exception as e:
+                    logging.warning("[FAKE] failed to write alert to DB: %s", e)
                 add_follow_task("FAKE", price, oi)
             elif br_type == "TRUE":
                 until = int(time.time() + 20*60)
@@ -793,7 +804,13 @@ def main_loop():
                 save_state(state, path=MODEL_STATE_FILE)
                 msg = build_alert_message("BREAKOUT", curr, stats or {}, z_vals, tei, thresholds)
                 msg = append_pro_tips(msg, curr, stats or {}, "BREAKOUT")
-                tg_send(msg); logging.info("[TRUE] %s", msg.replace("\n"," | "))
+                ok = tg_send(msg)
+                logging.info("[TRUE] %s", msg.replace("\n"," | "))
+                try:
+                    ts_iso = iso_now_utc()
+                    write_alert_to_db(ts_iso, "BREAKOUT_TRUE", msg, tei=tei, price=price, funding=funding, oi=oi, z_vals=z_vals, meta={"sent": ok})
+                except Exception as e:
+                    logging.warning("[TRUE] failed to write alert to DB: %s", e)
                 add_follow_task("BREAKOUT", price, oi)
 
             # regular signals handling
@@ -814,6 +831,12 @@ def main_loop():
                         alerts["funding"] += 1
                     if key.startswith("OI"):
                         alerts["oi"] += 1
+                    # write alert to DB
+                    try:
+                        ts_iso = iso_now_utc()
+                        write_alert_to_db(ts_iso, key, msg, tei=tei, price=price, funding=funding, oi=oi, z_vals=z_vals, meta={"sent": ok})
+                    except Exception as e:
+                        logging.warning("[ALERT] failed to write alert to DB: %s", e)
                     # add follow-up for major signals
                     if key in ("FUNDING_SPIKE", "OI_SPIKE"):
                         add_follow_task(key, price, oi)
@@ -836,8 +859,13 @@ def main_loop():
             if time.time() - last_15m >= SUMMARY_15M * 60:
                 msg15 = make_summary_message("15", samples_15m, alerts)
                 if msg15:
-                    tg_send(msg15)
-                    logging.info("[SUMMARY_15] sent")
+                    ok = tg_send(msg15)
+                    logging.info("[SUMMARY_15] sent=%s", ok)
+                    try:
+                        ts_iso = iso_now_utc()
+                        write_alert_to_db(ts_iso, "SUMMARY_15", msg15, meta={"sent": ok})
+                    except Exception as e:
+                        logging.warning("[SUMMARY_15] failed to write alert to DB: %s", e)
                 last_15m = time.time()
                 samples_15m = []
 
@@ -845,12 +873,17 @@ def main_loop():
             if time.time() - last_60m >= SUMMARY_60M * 60:
                 msg60 = make_summary_message("60", samples_60m, alerts)
                 if msg60:
-                    tg_send(msg60)
-                    logging.info("[SUMMARY_60] sent")
+                    ok = tg_send(msg60)
+                    logging.info("[SUMMARY_60] sent=%s", ok)
+                    try:
+                        ts_iso = iso_now_utc()
+                        write_alert_to_db(ts_iso, "SUMMARY_60", msg60, meta={"sent": ok})
+                    except Exception as e:
+                        logging.warning("[SUMMARY_60] failed to write alert to DB: %s", e)
                 last_60m = time.time()
                 samples_60m = []
 
-            # TEI history persist short
+            # record TEI history and save state
             thist = state.get("tei_history", [])
             thist.append({"ts": ts, "price": price, "tei": tei})
             state["tei_history"] = thist[-500:]
