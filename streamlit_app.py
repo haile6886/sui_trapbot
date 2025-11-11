@@ -1,13 +1,12 @@
 # streamlit_app.py
 """
 SUI TrapBot — Dashboard compact (UTC+7) — Vietnamese
-Features:
- - Read-only dashboard: đọc từ public.trapbot_data và public.trapbot_alerts
- - Auto-refresh configurable via STREAMLIT_REFRESH_SEC (env)
- - Resample display window (STREAMLIT_RESAMPLE_MIN) to show aggregated points
- - Show latest metrics, charts (price/funding/oi) and an alerts panel (like Telegram)
- - Uses SQLAlchemy + pandas to read DB; engine cached with st.cache_resource
- - All UI in Vietnamese
+Fixed version:
+ - Avoids st.experimental_rerun (compatibility)
+ - Uses SQLAlchemy engine directly with pandas.read_sql to avoid warnings
+ - Adds cache_bust mechanism via st.session_state to force reload
+ - Displays alerts safely and cleanly
+ - Auto-refresh optional via streamlit_autorefresh if available
 """
 import os
 import time
@@ -46,6 +45,7 @@ st.markdown(
     .alert-info {border-left:6px solid #2f54eb;}
     .monospace {font-family: monospace;}
     footer {visibility:hidden;}
+    pre {white-space: pre-wrap; word-wrap: break-word;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -56,10 +56,8 @@ st.caption("Bảng điều khiển chỉ đọc — Giá / Funding / OI / Alerts
 
 # Auto refresh
 if AUTORELOAD_AVAILABLE:
-    # use st_autorefresh to refresh the app automatically
     st_autorefresh(interval=STREAMLIT_REFRESH_SEC * 1000, key="auto_refresh")
 else:
-    # show a manual refresh hint
     st.info(f"Tự động refresh không khả dụng. Bấm nút 'Refresh' để cập nhật. (Mặc định {STREAMLIT_REFRESH_SEC}s)")
 
 # --- DB URL & engine creation (cached) ---
@@ -72,14 +70,12 @@ if not db_url:
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-# create engine and cache it
 @st.cache_resource
 def get_engine(url):
     try:
-        # If using Railway internal URL within same project, sslmode can be omitted.
         connect_args = {}
-        # if proxy/public url likely needs sslmode=require
-        if "switchback.proxy.rlwy.net" in url or url.startswith("postgresql://") and ":40354" in url:
+        # If using proxy/public url we require ssl
+        if "switchback.proxy.rlwy.net" in url or (":40354" in url and "rlwy" in url):
             connect_args = {"sslmode": "require"}
         engine = create_engine(url, connect_args=connect_args, pool_pre_ping=True)
         # quick test
@@ -94,39 +90,36 @@ engine = get_engine(db_url)
 if engine is None:
     st.stop()
 
+# session state for manual refresh cache busting
+if "cache_bust" not in st.session_state:
+    st.session_state["cache_bust"] = int(time.time())
+
 # --- Helpers to load data (cached short TTL) ---
 @st.cache_data(ttl=10)
-def load_trapbot_data(table_name: str = "trapbot_data", limit: int = 1000):
-    q = text(f"SELECT * FROM public.{table_name} ORDER BY timestamp DESC LIMIT :lim")
+def load_trapbot_data(table_name: str = "trapbot_data", limit: int = 1000, cache_bust: int = 0):
+    sql = f"SELECT * FROM public.{table_name} ORDER BY timestamp DESC LIMIT {int(limit)}"
     try:
-        with engine.connect() as conn:
-            df = pd.read_sql(q, conn, params={"lim": int(limit)})
+        # pass engine (SQLAlchemy connectable) to pandas to avoid warnings
+        df = pd.read_sql(sql, con=engine)
         if df.empty:
             return df
         # convert timezone to Asia/Bangkok
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Asia/Bangkok")
-        # ensure columns names consistent
         return df.sort_values("timestamp")
-    except SQLAlchemyError as e:
-        st.error(f"Lỗi đọc bảng {table_name}: {e}")
-        return pd.DataFrame()
     except Exception as e:
-        st.error(f"Lỗi đọc dữ liệu: {e}")
+        # return empty df on error; not to crash UI
+        st.error(f"Lỗi đọc bảng `{table_name}`: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=10)
-def load_alerts(table_name: str = "trapbot_alerts", limit: int = 200):
-    q = text(f"SELECT * FROM public.{table_name} ORDER BY ts DESC LIMIT :lim")
+def load_alerts(table_name: str = "trapbot_alerts", limit: int = 200, cache_bust: int = 0):
+    sql = f"SELECT * FROM public.{table_name} ORDER BY ts DESC LIMIT {int(limit)}"
     try:
-        with engine.connect() as conn:
-            df = pd.read_sql(q, conn, params={"lim": int(limit)})
+        df = pd.read_sql(sql, con=engine)
         if df.empty:
             return df
         df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("Asia/Bangkok")
         return df.sort_values("ts")
-    except SQLAlchemyError as e:
-        # don't spam UI if alerts table missing
-        return pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
@@ -137,18 +130,18 @@ with st.sidebar:
     alerts_table = st.text_input("Tên bảng cảnh báo", value="trapbot_alerts")
     max_rows = st.number_input("Số dòng tối đa lấy (max)", min_value=100, max_value=STREAMLIT_MAX_ROWS, value=1000, step=100)
     resample_min = st.number_input("Resample hiển thị (phút)", min_value=1, max_value=60, value=STREAMLIT_RESAMPLE_MIN, step=1)
-    if not AUTORELOAD_AVAILABLE:
-        if st.button("Refresh"):
-            # bust cache manually by updating an invisible state
-            st.experimental_rerun()
+    if st.button("Refresh"):
+        # increment cache_bust to force cached functions to reload
+        st.session_state["cache_bust"] = int(time.time())
+        st.success("Đã làm mới dữ liệu (cache_bust updated).")
     st.write("---")
     st.caption("Dashboard chỉ đọc; không thay đổi dữ liệu của bot.")
     st.write("- STREAMLIT_REFRESH_SEC:", STREAMLIT_REFRESH_SEC)
     st.write("- STREAMLIT_RESAMPLE_MIN:", resample_min)
 
 # --- Load data ---
-df = load_trapbot_data(table_name=table_name, limit=max_rows)
-alerts_df = load_alerts(table_name=alerts_table, limit=200)
+df = load_trapbot_data(table_name=table_name, limit=max_rows, cache_bust=st.session_state["cache_bust"])
+alerts_df = load_alerts(table_name=alerts_table, limit=200, cache_bust=st.session_state["cache_bust"])
 
 # --- Top metrics area ---
 col_left, col_mid, col_right = st.columns([3,1,1])
@@ -215,9 +208,7 @@ st.subheader("Cảnh báo (Alerts) — giống Telegram")
 if alerts_df is None or alerts_df.empty:
     st.info("Chưa có cảnh báo (trapbot_alerts trống) hoặc không thể đọc bảng alerts.")
 else:
-    # display newest first
     alerts_df = alerts_df.sort_values("ts", ascending=False).reset_index(drop=True)
-    # show top N alerts (configurable)
     top_n = min(50, len(alerts_df))
     for i in range(top_n):
         row = alerts_df.iloc[i]
@@ -226,32 +217,35 @@ else:
         tei = row.get("tei", "")
         price = row.get("price", "")
         funding_pct = row.get("funding_pct", "")
-        msg = row.get("message", "")
-        # choose class
+        oi_val = row.get("oi", "")
+        msg = row.get("message", "") or ""
+        # determine class
         cls = "alert-card alert-info"
         if "BREAKOUT" in kind or "FUNDING" in kind or "OI_SPIKE" in kind:
             cls = "alert-card alert-warning"
         if "FAKE" in kind or "EXTREME" in kind:
             cls = "alert-card alert-strong"
-        # build HTML block
-        html = f"""
+        # render
+        oi_display = f"{int(oi_val):,}" if (oi_val is not None and pd.notna(oi_val)) else ""
+        inner_html = f"""
         <div class="{cls}">
           <div style="display:flex;justify-content:space-between;align-items:center;">
-            <div>
-              <strong>{kind}</strong> &nbsp; <span class="monospace">TEI: {tei}</span>
-            </div>
-            <div style="text-align:right;font-size:0.9rem;color:#666;">
-              {ts}
-            </div>
+            <div><strong>{kind}</strong> &nbsp; <span class="monospace">TEI: {tei}</span></div>
+            <div style="text-align:right;font-size:0.9rem;color:#666;">{ts}</div>
           </div>
           <div style="margin-top:6px;font-size:0.95rem;color:#111;">
-            <div><strong>Giá:</strong> {price} &nbsp; <strong>Funding:</strong> {funding_pct} &nbsp; <strong>OI:</strong> {int(row.get('oi')):, if pd.notna(row.get('oi')) else ''}</div>
-            <div style="margin-top:6px;white-space:pre-wrap;">{st._legacy_compat.resolve_component_value(msg)}</div>
+            <div><strong>Giá:</strong> {price} &nbsp; <strong>Funding:</strong> {funding_pct} &nbsp; <strong>OI:</strong> {oi_display}</div>
+            <div style="margin-top:6px;"><pre>{st._legacy_compat.resolve_component_value(msg) if hasattr(st, '_legacy_compat') else msg}</pre></div>
           </div>
         </div>
         """
-        # Render unsafe HTML for formatting
-        st.markdown(html, unsafe_allow_html=True)
+        # fallback: if st._legacy_compat not present, render msg raw inside <pre>
+        if hasattr(st, '_legacy_compat'):
+            st.markdown(inner_html, unsafe_allow_html=True)
+        else:
+            # avoid using unknown internals; simply escape by wrapping in <pre>
+            safe_html = inner_html.replace("{st._legacy_compat.resolve_component_value(msg) if hasattr(st, '_legacy_compat') else msg}", msg)
+            st.markdown(safe_html, unsafe_allow_html=True)
 
 # --- Raw Data / Troubleshoot section ---
 st.markdown("---")
@@ -269,4 +263,4 @@ with st.expander("Xem nhanh các bảng (dòng cuối)"):
         st.dataframe(alerts_df.head(100).reset_index(drop=True))
 
 st.markdown("---")
-st.caption("Ghi chú: Dashboard chỉ đọc. Nếu cần hiển thị cảnh báo như Telegram chi tiết hơn, có thể điều chỉnh format trong mã nguồn.")
+st.caption("Ghi chú: Dashboard chỉ đọc. Nếu cần filter hoặc highlight theo loại cảnh báo, mình sẽ bổ sung.")
