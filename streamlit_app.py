@@ -1,301 +1,272 @@
 # streamlit_app.py
 """
-SUI TrapBot — Dashboard compact (UTC+7)
-Compatibility fix: support streamlit versions without experimental_singleton
-- Read-only: không ghi gì vào DB
-- Hiển thị toàn bộ trên một màn hình (wide)
-- Dữ liệu gom theo N phút (mặc định 5 phút)
-- Alerts cục bộ (hiển thị giống Telegram, tiếng Việt)
-- Auto-refresh configurable
+SUI TrapBot — Dashboard compact (UTC+7) — Vietnamese
+Features:
+ - Read-only dashboard: đọc từ public.trapbot_data và public.trapbot_alerts
+ - Auto-refresh configurable via STREAMLIT_REFRESH_SEC (env)
+ - Resample display window (STREAMLIT_RESAMPLE_MIN) to show aggregated points
+ - Show latest metrics, charts (price/funding/oi) and an alerts panel (like Telegram)
+ - Uses SQLAlchemy + pandas to read DB; engine cached with st.cache_resource
+ - All UI in Vietnamese
 """
 import os
 import time
-import math
+from datetime import timezone
 from pathlib import Path
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, text
-from urllib.parse import urlparse
+from sqlalchemy.exc import SQLAlchemyError
 
-# Optional fast autorefresh
+# Optional autorefresh helper
 try:
     from streamlit_autorefresh import st_autorefresh
     AUTORELOAD_AVAILABLE = True
 except Exception:
     AUTORELOAD_AVAILABLE = False
 
-# --- Config & UI setup ---
+# --- Config / Defaults from env ---
 BASE_DIR = Path(__file__).resolve().parent
-st.set_page_config(page_title="SUI TrapBot — Dashboard", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="SUI TrapBot — Dashboard", layout="wide")
 
-st.markdown("""
-<style>
-h1 {font-size:26px;}
-h2 {font-size:18px;}
-footer {visibility:hidden;}
-</style>
-""", unsafe_allow_html=True)
+# Environment-configurable params
+STREAMLIT_REFRESH_SEC = int(os.getenv("STREAMLIT_REFRESH_SEC", "30"))        # default 30s
+STREAMLIT_RESAMPLE_MIN = int(os.getenv("STREAMLIT_RESAMPLE_MIN", "5"))      # resample window in minutes
+STREAMLIT_MAX_ROWS = int(os.getenv("STREAMLIT_MAX_ROWS", "2000"))           # max rows to fetch
 
-# Env defaults (có thể override bằng Railway Variables)
-REFRESH_SEC = int(os.getenv("STREAMLIT_REFRESH_SEC", "30"))      # thời gian refresh trang (giây)
-RESAMPLE_MIN = int(os.getenv("STREAMLIT_RESAMPLE_MIN", "5"))    # gom theo phút (mặc định 5)
-MAX_ROWS = int(os.getenv("STREAMLIT_MAX_ROWS", "2000"))         # số dòng lấy từ DB
-ALERT_FUND_SIGMA = float(os.getenv("ALERT_FUND_SIGMA", "2.0"))  # ngưỡng z-score funding
-ALERT_OI_SIGMA = float(os.getenv("ALERT_OI_SIGMA", "2.0"))      # ngưỡng z-score OI
+st.markdown(
+    """
+    <style>
+    .stApp .block-container{padding-top:0.5rem;}
+    .alert-card {border-radius:10px;padding:12px;margin-bottom:8px;box-shadow:0 1px 2px rgba(0,0,0,0.06);}
+    .alert-strong {border-left:6px solid #ff4d4f;}
+    .alert-warning {border-left:6px solid #ffa940;}
+    .alert-info {border-left:6px solid #2f54eb;}
+    .monospace {font-family: monospace;}
+    footer {visibility:hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# Auto refresh (try library first, fallback meta-refresh)
+st.title("📊 SUI TrapBot — Dashboard (UTC+7)")
+st.caption("Bảng điều khiển chỉ đọc — Giá / Funding / OI / Alerts (Tiếng Việt)")
+
+# Auto refresh
 if AUTORELOAD_AVAILABLE:
-    st_autorefresh(interval=REFRESH_SEC * 1000, key="auto_refresh")
+    # use st_autorefresh to refresh the app automatically
+    st_autorefresh(interval=STREAMLIT_REFRESH_SEC * 1000, key="auto_refresh")
+else:
+    # show a manual refresh hint
+    st.info(f"Tự động refresh không khả dụng. Bấm nút 'Refresh' để cập nhật. (Mặc định {STREAMLIT_REFRESH_SEC}s)")
 
-# fallback meta refresh (works in plain browsers)
-st.markdown(f"<meta http-equiv='refresh' content='{REFRESH_SEC}'>", unsafe_allow_html=True)
-
-# Header
-st.title("📊 SUI TrapBot — Dashboard (Compact, UTC+7)")
-st.caption(f"Tự động làm mới mỗi {REFRESH_SEC}s — Biểu đồ gom theo {RESAMPLE_MIN} phút — {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-# --- DB connect ---
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    st.error("❌ DATABASE_URL chưa được thiết lập. Vui lòng thêm biến môi trường DATABASE_URL = ${Postgres-mCs3.DATABASE_URL} trong Railway.")
+# --- DB URL & engine creation (cached) ---
+db_url = os.getenv("DATABASE_URL", "").strip()
+if not db_url:
+    st.error("❌ DATABASE_URL chưa thiết lập. Vào Railway → Service empowering_hope → Variables → thêm DATABASE_URL.")
     st.stop()
 
-# normalize scheme if needed
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# ensure scheme correctness for SQLAlchemy
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-# show DB host (không lộ password)
-try:
-    u = urlparse(DATABASE_URL)
-    st.sidebar.write("DB host:", u.hostname, "port:", u.port)
-except Exception:
-    pass
-
-# --- Compatibility wrapper for caching a DB engine factory ---
-# Prefer st.experimental_singleton -> st.cache_resource -> fallback
-_engine_decorator = None
-if hasattr(st, "experimental_singleton"):
-    _engine_decorator = st.experimental_singleton
-elif hasattr(st, "cache_resource"):
-    _engine_decorator = st.cache_resource
-else:
-    # fallback: simple module-level cache
-    _engine_cache = {}
-    def _fake_singleton(func=None, **kwargs):
-        if func is None:
-            def _wrap(f):
-                name = f.__name__
-                def wrapper(*a, **k):
-                    if name not in _engine_cache:
-                        _engine_cache[name] = f(*a, **k)
-                    return _engine_cache[name]
-                return wrapper
-            return _wrap
-        else:
-            name = func.__name__
-            def wrapper(*a, **k):
-                if name not in _engine_cache:
-                    _engine_cache[name] = func(*a, **k)
-                return _engine_cache[name]
-            return wrapper
-    _engine_decorator = _fake_singleton
-
-@_engine_decorator(show_spinner=False) if callable(_engine_decorator) else (lambda f: f)
+# create engine and cache it
+@st.cache_resource
 def get_engine(url):
-    """
-    Tạo SQLAlchemy engine an toàn, cached.
-    Sử dụng đc cho nhiều phiên bản Streamlit.
-    """
     try:
-        eng = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
-        # quick smoke test
-        with eng.connect() as conn:
+        # If using Railway internal URL within same project, sslmode can be omitted.
+        connect_args = {}
+        # if proxy/public url likely needs sslmode=require
+        if "switchback.proxy.rlwy.net" in url or url.startswith("postgresql://") and ":40354" in url:
+            connect_args = {"sslmode": "require"}
+        engine = create_engine(url, connect_args=connect_args, pool_pre_ping=True)
+        # quick test
+        with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return eng
+        return engine
     except Exception as e:
-        # show trong sidebar, trả về None để app dừng an toàn
-        st.sidebar.error(f"Kết nối DB lỗi: {e}")
+        st.error(f"Không thể kết nối DB: {e}")
         return None
 
-engine = get_engine(DATABASE_URL)
+engine = get_engine(db_url)
 if engine is None:
     st.stop()
 
-# --- Sidebar controls (người dùng có thể thay tham số tại runtime) ---
-with st.sidebar:
-    st.header("Tùy chỉnh")
-    table_name = st.text_input("Tên bảng (table)", value="trapbot_data")
-    refresh_sec = st.number_input("Refresh (giây)", min_value=5, max_value=600, value=REFRESH_SEC, step=5)
-    resample_min = st.number_input("Gom theo (phút)", min_value=1, max_value=60, value=RESAMPLE_MIN, step=1)
-    max_rows = st.number_input("Số dòng tối đa", min_value=100, max_value=10000, value=MAX_ROWS, step=100)
-    alert_f_sigma = st.number_input("Ngưỡng Funding z (sigma)", min_value=0.5, max_value=6.0, value=ALERT_FUND_SIGMA, step=0.1)
-    alert_oi_sigma = st.number_input("Ngưỡng OI z (sigma)", min_value=0.5, max_value=6.0, value=ALERT_OI_SIGMA, step=0.1)
-    if st.button("Làm mới (force)"):
-        st.experimental_rerun()
-    st.write("---")
-    st.caption("Dashboard chỉ đọc dữ liệu. Để trigger retrain, dùng SQL thủ công.")
-
-# apply sidebar overrides
-REFRESH_SEC = int(refresh_sec)
-RESAMPLE_MIN = int(resample_min)
-MAX_ROWS = int(max_rows)
-ALERT_FUND_SIGMA = float(alert_f_sigma)
-ALERT_OI_SIGMA = float(alert_oi_sigma)
-
-# --- Data loading (cache ngắn để giảm load DB) ---
-@st.cache_data(ttl=REFRESH_SEC)
-def load_data(table: str, limit: int):
-    q = text(f"SELECT * FROM public.{table} ORDER BY timestamp DESC LIMIT :lim")
+# --- Helpers to load data (cached short TTL) ---
+@st.cache_data(ttl=10)
+def load_trapbot_data(table_name: str = "trapbot_data", limit: int = 1000):
+    q = text(f"SELECT * FROM public.{table_name} ORDER BY timestamp DESC LIMIT :lim")
     try:
         with engine.connect() as conn:
-            df = pd.read_sql(q, conn, params={"lim": limit})
+            df = pd.read_sql(q, conn, params={"lim": int(limit)})
         if df.empty:
             return df
-        # convert timestamp to tz Asia/Bangkok for display & resampling (assume timestamptz/UTC stored)
+        # convert timezone to Asia/Bangkok
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Asia/Bangkok")
-        df = df.sort_values("timestamp")
-        return df
+        # ensure columns names consistent
+        return df.sort_values("timestamp")
+    except SQLAlchemyError as e:
+        st.error(f"Lỗi đọc bảng {table_name}: {e}")
+        return pd.DataFrame()
     except Exception as e:
-        st.sidebar.error(f"Query lỗi: {e}")
+        st.error(f"Lỗi đọc dữ liệu: {e}")
         return pd.DataFrame()
 
-df = load_data(table_name, MAX_ROWS)
-
-# --- Top metrics (hiển thị trên 1 hàng) ---
-if df.empty:
-    st.warning("Chưa có dữ liệu hoặc không đọc được bảng. Kiểm tra tên bảng / chờ bot ghi dữ liệu.")
-else:
-    last = df.iloc[-1]
-    c1, c2, c3, c4, c5 = st.columns([1.4,1.2,1.2,1.2,1.2])
-
-    # Giá (price)
-    price_val = last.get("price") if "price" in df.columns else None
-    if pd.notna(price_val):
-        c1.metric("Giá (mark)", f"{float(price_val):.6f}")
-    else:
-        c1.metric("Giá (mark)", "n/a")
-
-    # current_price (nếu có)
-    if "current_price" in df.columns:
-        cp = last.get("current_price")
-        c2.metric("Live (current_price)", f"{float(cp):.6f}" if pd.notna(cp) else "n/a")
-    else:
-        c2.metric("Live (current_price)", "Không có cột current_price")
-
-    # Funding
-    funding_col = next((c for c in ("funding_pct","funding","fund_rate") if c in df.columns), None)
-    if funding_col:
-        fval = last.get(funding_col)
-        c3.metric("Funding (%)", f"{float(fval):.6f}%")
-    else:
-        c3.metric("Funding (%)", "n/a")
-
-    # OI
-    oi_col = next((c for c in ("oi","open_interest") if c in df.columns), None)
-    if oi_col:
-        oval = last.get(oi_col)
-        c4.metric("Open Interest", f"{int(oval):,}" if pd.notna(oval) else "n/a")
-    else:
-        c4.metric("Open Interest", "n/a")
-
-    # Last timestamp
-    ts_display = pd.to_datetime(last["timestamp"]).strftime("%Y-%m-%d %H:%M:%S %Z")
-    c5.metric("Bản ghi cuối (Asia/Bangkok)", ts_display)
-
-st.markdown("---")
-
-# --- Prepare resampled data for charts (gom theo RESAMPLE_MIN phút) ---
-if not df.empty:
-    df_chart = df.set_index("timestamp").copy()
-    # chọn cột an toàn
-    if "funding" in df_chart.columns and "funding_pct" not in df_chart.columns:
-        df_chart = df_chart.rename(columns={"funding":"funding_pct"})
-    if "open_interest" in df_chart.columns and "oi" not in df_chart.columns:
-        df_chart = df_chart.rename(columns={"open_interest":"oi"})
-
+@st.cache_data(ttl=10)
+def load_alerts(table_name: str = "trapbot_alerts", limit: int = 200):
+    q = text(f"SELECT * FROM public.{table_name} ORDER BY ts DESC LIMIT :lim")
     try:
-        df_res = df_chart.resample(f"{RESAMPLE_MIN}T").last().dropna(how="all")
+        with engine.connect() as conn:
+            df = pd.read_sql(q, conn, params={"lim": int(limit)})
+        if df.empty:
+            return df
+        df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("Asia/Bangkok")
+        return df.sort_values("ts")
+    except SQLAlchemyError as e:
+        # don't spam UI if alerts table missing
+        return pd.DataFrame()
     except Exception:
-        df_res = df_chart.copy()
+        return pd.DataFrame()
 
-    left, right = st.columns([2.2,1])
+# --- Sidebar controls (Vietnamese) ---
+with st.sidebar:
+    st.header("Tùy chọn")
+    table_name = st.text_input("Tên bảng dữ liệu", value="trapbot_data")
+    alerts_table = st.text_input("Tên bảng cảnh báo", value="trapbot_alerts")
+    max_rows = st.number_input("Số dòng tối đa lấy (max)", min_value=100, max_value=STREAMLIT_MAX_ROWS, value=1000, step=100)
+    resample_min = st.number_input("Resample hiển thị (phút)", min_value=1, max_value=60, value=STREAMLIT_RESAMPLE_MIN, step=1)
+    if not AUTORELOAD_AVAILABLE:
+        if st.button("Refresh"):
+            # bust cache manually by updating an invisible state
+            st.experimental_rerun()
+    st.write("---")
+    st.caption("Dashboard chỉ đọc; không thay đổi dữ liệu của bot.")
+    st.write("- STREAMLIT_REFRESH_SEC:", STREAMLIT_REFRESH_SEC)
+    st.write("- STREAMLIT_RESAMPLE_MIN:", resample_min)
 
-    with left:
-        st.subheader(f"Giá & Live (gom {RESAMPLE_MIN} phút)")
-        if "price" in df_res.columns or "current_price" in df_res.columns:
-            cp = df_res[["price","current_price"]].copy() if "current_price" in df_res.columns else df_res[["price"]].copy()
-            st.line_chart(cp)
-        else:
-            st.info("Không đủ dữ liệu giá để vẽ biểu đồ.")
+# --- Load data ---
+df = load_trapbot_data(table_name=table_name, limit=max_rows)
+alerts_df = load_alerts(table_name=alerts_table, limit=200)
 
-        st.subheader("Funding (%)")
-        if "funding_pct" in df_res.columns:
-            st.line_chart(df_res[["funding_pct"]])
-        else:
-            st.info("Không có dữ liệu Funding để vẽ.")
-
-        st.subheader("Open Interest (OI)")
-        if "oi" in df_res.columns:
-            st.line_chart(df_res[["oi"]])
-        else:
-            st.info("Không có dữ liệu OI.")
-
-    with right:
-        st.subheader("Alerts (phát hiện cục bộ — tiếng Việt)")
-        window = min(len(df), max(50, int(60 / max(1, RESAMPLE_MIN))))
-        recent = df.tail(window).set_index("timestamp")
-        alerts = []
+# --- Top metrics area ---
+col_left, col_mid, col_right = st.columns([3,1,1])
+if not df.empty:
+    last = df.iloc[-1]
+    try:
+        price_s = f"{float(last.get('price', 0)):.6f}"
+    except Exception:
+        price_s = str(last.get("price", "n/a"))
+    col_left.metric("Giá (mới nhất)", price_s)
+    # funding - detect column name
+    funding_col = next((c for c in ("funding_pct", "funding", "fund_rate") if c in df.columns), None)
+    if funding_col:
         try:
-            if "funding_pct" in recent.columns:
-                fm = recent["funding_pct"].mean()
-                fs = recent["funding_pct"].std(ddof=0) if recent["funding_pct"].std(ddof=0) > 0 else 1e-9
-            else:
-                fm, fs = 0.0, 1e9
-            if "oi" in recent.columns:
-                om = recent["oi"].mean()
-                osd = recent["oi"].std(ddof=0) if recent["oi"].std(ddof=0) > 0 else 1e-9
-            else:
-                om, osd = 0.0, 1e9
+            funding_val = float(last.get(funding_col, 0.0))
+            col_mid.metric("Funding (%)", f"{funding_val:.6f}%")
+        except Exception:
+            col_mid.metric("Funding (%)", str(last.get(funding_col, "n/a")))
+    else:
+        col_mid.metric("Funding (%)", "n/a")
+    # OI
+    oi_col = next((c for c in ("oi", "open_interest") if c in df.columns), None)
+    if oi_col:
+        try:
+            oi_val = int(last.get(oi_col)) if pd.notna(last.get(oi_col)) else None
+            col_right.metric("Open Interest", f"{oi_val:,}" if oi_val is not None else "n/a")
+        except Exception:
+            col_right.metric("Open Interest", str(last.get(oi_col, "n/a")))
+else:
+    col_left.info("Chưa có dữ liệu trong bảng hoặc không thể đọc.")
 
-            check_rows = recent.tail(6)
-            for idx, row in check_rows.iterrows():
-                ts_s = idx.strftime("%Y-%m-%d %H:%M:%S")
-                if "funding_pct" in row.index and pd.notna(row["funding_pct"]):
-                    zf = (row["funding_pct"] - fm) / (fs + 1e-12)
-                    if abs(zf) >= ALERT_FUND_SIGMA:
-                        emoji = "🔴" if abs(zf) >= 2.5 else "🟠"
-                        txt = f"⚠️ FUNDING BẤT THƯỜNG {emoji}\n- Thời gian: {ts_s}\n- Funding: {row['funding_pct']:.6f}% | z={zf:.2f}"
-                        alerts.append(("FUNDING", zf, txt, idx))
-                if "oi" in row.index and pd.notna(row["oi"]):
-                    zo = (row["oi"] - om) / (osd + 1e-12)
-                    if abs(zo) >= ALERT_OI_SIGMA:
-                        emoji = "🔴" if abs(zo) >= 2.5 else "🟠"
-                        txt = f"⚠️ OI BẤT THƯỜNG {emoji}\n- Thời gian: {ts_s}\n- OI: {int(row['oi']):,} | z={zo:.2f}"
-                        alerts.append(("OI", zo, txt, idx))
-        except Exception as e:
-            st.warning(f"Lỗi khi tính alerts: {e}")
-
-        if alerts:
-            alerts_sorted = sorted(alerts, key=lambda x: x[3], reverse=True)
-            for a in alerts_sorted:
-                _, z, msg, _ = a
-                st.markdown(f"**{msg.splitlines()[1].split(':',1)[1].strip()}**")
-                st.info(msg)
-        else:
-            st.success("Không phát hiện alert bất thường (theo kiểm tra cục bộ).")
-
-        st.markdown("---")
-        st.subheader("Bản ghi cuối (gần nhất)")
-        show_n = min(30, len(df))
-        tail = df.tail(show_n).copy()
-        tail["timestamp"] = tail["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
-        display_cols = [c for c in ("id","timestamp","price","current_price","funding_pct","oi") if c in tail.columns]
-        st.dataframe(tail[display_cols], use_container_width=True, height=520)
-
-# --- Footer: info & troubleshooting ---
+# --- Main charts ---
 st.markdown("---")
-st.markdown("**Thông tin / Khắc phục nhanh**")
-st.write(f"- DB (kết nối): `{engine.url}`")
-st.write("- Nếu thời gian hiển thị không đúng VN, kiểm tra kiểu cột `timestamp` (nên là timestamptz lưu UTC).")
-st.write("- Dashboard chỉ đọc dữ liệu; không thay đổi bot.")
+st.subheader("Biểu đồ: Giá / Funding / Open Interest (gần đây)")
+if not df.empty and "timestamp" in df.columns:
+    plot_df = df.copy()
+    # optional resample: downsample to per resample_min minute by taking last value within bucket
+    try:
+        if resample_min > 1:
+            plot_df = plot_df.set_index("timestamp").resample(f"{resample_min}T").last().dropna().reset_index()
+    except Exception:
+        plot_df = plot_df.sort_values("timestamp")
+    # Price
+    if "price" in plot_df.columns:
+        fig_price = px.line(plot_df, x="timestamp", y="price", title="Price", height=320)
+        fig_price.update_xaxes(rangeslider_visible=True)
+        st.plotly_chart(fig_price, use_container_width=True)
+    # Funding
+    funding_col = next((c for c in ("funding_pct", "funding", "fund_rate") if c in plot_df.columns), None)
+    if funding_col:
+        fig_f = px.line(plot_df, x="timestamp", y=funding_col, title="Funding (%)", height=240)
+        st.plotly_chart(fig_f, use_container_width=True)
+    # OI
+    oi_col = next((c for c in ("oi", "open_interest") if c in plot_df.columns), None)
+    if oi_col:
+        fig_oi = px.line(plot_df, x="timestamp", y=oi_col, title="Open Interest", height=240)
+        st.plotly_chart(fig_oi, use_container_width=True)
+else:
+    st.info("Đang chờ dữ liệu từ bot (trapbot_data). Kiểm tra tên bảng hoặc chờ vài phút.")
+
+# --- Alerts panel (like Telegram) ---
+st.markdown("---")
+st.subheader("Cảnh báo (Alerts) — giống Telegram")
+if alerts_df is None or alerts_df.empty:
+    st.info("Chưa có cảnh báo (trapbot_alerts trống) hoặc không thể đọc bảng alerts.")
+else:
+    # display newest first
+    alerts_df = alerts_df.sort_values("ts", ascending=False).reset_index(drop=True)
+    # show top N alerts (configurable)
+    top_n = min(50, len(alerts_df))
+    for i in range(top_n):
+        row = alerts_df.iloc[i]
+        ts = row.get("ts")
+        kind = str(row.get("kind", "")).upper()
+        tei = row.get("tei", "")
+        price = row.get("price", "")
+        funding_pct = row.get("funding_pct", "")
+        msg = row.get("message", "")
+        # choose class
+        cls = "alert-card alert-info"
+        if "BREAKOUT" in kind or "FUNDING" in kind or "OI_SPIKE" in kind:
+            cls = "alert-card alert-warning"
+        if "FAKE" in kind or "EXTREME" in kind:
+            cls = "alert-card alert-strong"
+        # build HTML block
+        html = f"""
+        <div class="{cls}">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <strong>{kind}</strong> &nbsp; <span class="monospace">TEI: {tei}</span>
+            </div>
+            <div style="text-align:right;font-size:0.9rem;color:#666;">
+              {ts}
+            </div>
+          </div>
+          <div style="margin-top:6px;font-size:0.95rem;color:#111;">
+            <div><strong>Giá:</strong> {price} &nbsp; <strong>Funding:</strong> {funding_pct} &nbsp; <strong>OI:</strong> {int(row.get('oi')):, if pd.notna(row.get('oi')) else ''}</div>
+            <div style="margin-top:6px;white-space:pre-wrap;">{st._legacy_compat.resolve_component_value(msg)}</div>
+          </div>
+        </div>
+        """
+        # Render unsafe HTML for formatting
+        st.markdown(html, unsafe_allow_html=True)
+
+# --- Raw Data / Troubleshoot section ---
+st.markdown("---")
+st.subheader("Dữ liệu thô / Kiểm tra")
+with st.expander("Xem nhanh các bảng (dòng cuối)"):
+    try:
+        st.write("DB host:", engine.url)
+    except Exception:
+        st.write("DB host: (không xác định)")
+    st.write(f"Đã load {len(df)} dòng từ `{table_name}`.")
+    st.write(f"Đã load {len(alerts_df)} dòng từ `{alerts_table}`.")
+    if not df.empty:
+        st.dataframe(df.tail(50).reset_index(drop=True))
+    if not alerts_df.empty:
+        st.dataframe(alerts_df.head(100).reset_index(drop=True))
+
+st.markdown("---")
+st.caption("Ghi chú: Dashboard chỉ đọc. Nếu cần hiển thị cảnh báo như Telegram chi tiết hơn, có thể điều chỉnh format trong mã nguồn.")
