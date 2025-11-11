@@ -171,7 +171,7 @@ def load_recent(limit, path=DATA_LOG_FILE):
         return []
 
 # ------------------ DB write (optional) ------------------
-def write_to_db(ts_iso, price, funding, oi):
+def write_to_db(ts_iso, price, funding, oi, current_price=None):
     """Insert row into Postgres trapbot_data if DB_ENGINE configured."""
     if not DB_ENGINE:
         logging.debug("[DB] DB_ENGINE not available, skipping write")
@@ -179,10 +179,19 @@ def write_to_db(ts_iso, price, funding, oi):
     try:
         with DB_ENGINE.begin() as conn:
             q = text(f"""
-                INSERT INTO {DB_TABLE_NAME} (timestamp, price, funding_pct, oi)
-                VALUES (:ts, :price, :funding, :oi)
+                INSERT INTO {DB_TABLE_NAME} (timestamp, price, funding_pct, oi, other_json, current_price)
+                VALUES (:ts, :price, :funding, :oi, :other_json, :current_price)
             """)
-            conn.execute(q, {"ts": ts_iso, "price": float(price), "funding": float(funding), "oi": int(oi)})
+            # create a minimal other_json if you want to store extras (keep compatibility)
+            other_json = {}
+            conn.execute(q, {
+                "ts": ts_iso,
+                "price": float(price),
+                "funding": float(funding),
+                "oi": int(oi),
+                "other_json": json.dumps(other_json),
+                "current_price": float(current_price) if current_price is not None else None
+            })
         logging.info("[DB] ✅ Đã ghi dữ liệu vào %s", DB_TABLE_NAME)
         return True
     except SQLAlchemyError as e:
