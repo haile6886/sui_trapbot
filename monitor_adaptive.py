@@ -17,6 +17,7 @@ Features:
  - Configurable via .env / Railway variables
 """
 import os
+import sys
 import time
 import csv
 import json
@@ -28,6 +29,7 @@ import warnings
 import logging
 import traceback
 from collections import deque, defaultdict
+from urllib.parse import urlparse
 
 # env
 from dotenv import load_dotenv
@@ -40,6 +42,10 @@ from sqlalchemy.exc import SQLAlchemyError, OperationalError
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# Immediate startup print to make sure container/script actually runs (visible in Railway logs)
+print("[DEBUG-START] monitor_adaptive starting", time.time())
+sys.stdout.flush()
 
 # Env / defaults
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "7"))   # VN = UTC+7
@@ -73,26 +79,74 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # Database / SQLAlchemy engine
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_ENGINE = None
-# Improved DB connect: retry with short connect_timeout
-if WRITE_TO_DB and DATABASE_URL:
-    for attempt in range(1, 6):
+
+# ------------------ Improved DB init with retry/backoff ------------------
+def init_db_engine(max_attempts=6, base_delay=2):
+    """
+    Robust initialization of SQLAlchemy engine with retry and connect timeout.
+    Call this at import time (if WRITE_TO_DB) and the main loop will attempt to re-init if needed.
+    """
+    global DB_ENGINE, DATABASE_URL
+    if not DATABASE_URL:
+        logging.warning("[DB] DATABASE_URL not set; DB disabled")
+        return None
+
+    # Log parsed host for debug (visible in Railway logs)
+    try:
+        u = urlparse(DATABASE_URL)
+        logging.info("[DB-DEBUG] Using DATABASE_URL host=%s port=%s db=%s user=%s",
+                     u.hostname, u.port, u.path.lstrip("/"), u.username)
+        print(f"[DB-DEBUG] host={u.hostname} port={u.port} db={u.path.lstrip('/')} user={u.username}")
+        sys.stdout.flush()
+    except Exception as e:
+        logging.warning("[DB-DEBUG] cannot parse DATABASE_URL: %s", e)
+
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
         try:
-            DB_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+            eng = create_engine(
+                DATABASE_URL,
+                pool_pre_ping=True,
+                connect_args={"connect_timeout": 10},
+                pool_size=5,
+                max_overflow=5,
+                pool_timeout=10
+            )
             # quick test connection
-            with DB_ENGINE.connect() as conn:
+            with eng.connect() as conn:
                 conn.execute(text("SELECT 1"))
+            DB_ENGINE = eng
             logging.info("[DB] Connected to database on attempt %d", attempt)
-            break
-        except OperationalError as oe:
-            logging.warning("[DB] connect attempt %d failed: %s", attempt, oe)
+            print(f"[DB] Connected on attempt {attempt}")
+            sys.stdout.flush()
+            return DB_ENGINE
+        except OperationalError as e:
+            logging.warning("[DB] connect attempt %d failed: %s", attempt, e)
+            print(f"[DB] connect attempt {attempt} failed: {e}")
+            sys.stdout.flush()
             DB_ENGINE = None
-            time.sleep(min(5 * attempt, 30))
+            # exponential backoff with small jitter
+            sleep_for = base_delay * (2 ** (attempt - 1))
+            jitter = min(5, sleep_for * 0.1)
+            time.sleep(sleep_for + (jitter * (0.5 - (attempt % 2))))
         except Exception as e:
             logging.error("[DB] unexpected error on connect attempt %d: %s", attempt, e)
+            print(f"[DB] unexpected error on connect attempt {attempt}: {e}")
+            sys.stdout.flush()
             DB_ENGINE = None
-            time.sleep(min(5 * attempt, 30))
+            time.sleep(base_delay)
+    logging.warning("[DB] All connection attempts failed; DB disabled for now")
+    print("[DB] All connection attempts failed; DB disabled for now")
+    sys.stdout.flush()
+    DB_ENGINE = None
+    return None
 
-# Logging
+if WRITE_TO_DB:
+    # attempt init at startup
+    init_db_engine()
+
+# ------------------ Logging ------------------
 LOG_FILE = os.path.join(BASE_DIR, "trapbot_send.log")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
@@ -183,19 +237,25 @@ def load_recent(limit, path=DATA_LOG_FILE):
         logging.warning("[load_recent] %s", e)
         return []
 
-# ------------------ DB write (optional) ------------------
+# ------------------ DB write (optional, robust) ------------------
 def write_to_db(ts_iso, price, funding, oi, current_price=None):
     """Insert row into Postgres trapbot_data if DB_ENGINE configured."""
-    if not DB_ENGINE:
-        logging.debug("[DB] DB_ENGINE not available, skipping write")
+    global DB_ENGINE
+    if not WRITE_TO_DB:
+        logging.debug("[DB] WRITE_TO_DB=false; skipping DB write")
         return False
+    if DB_ENGINE is None:
+        logging.info("[DB] DB_ENGINE not ready, attempting init...")
+        init_db_engine()
+        if DB_ENGINE is None:
+            logging.warning("[DB] DB_ENGINE still None after init; skipping write")
+            return False
     try:
         with DB_ENGINE.begin() as conn:
             q = text(f"""
                 INSERT INTO {DB_TABLE_NAME} (timestamp, price, funding_pct, oi, other_json, current_price)
                 VALUES (:ts, :price, :funding, :oi, :other_json, :current_price)
             """)
-            # minimal other_json kept for compatibility; change if you want to store extras
             other_json = {}
             conn.execute(q, {
                 "ts": ts_iso,
@@ -205,13 +265,22 @@ def write_to_db(ts_iso, price, funding, oi, current_price=None):
                 "other_json": json.dumps(other_json),
                 "current_price": float(current_price) if current_price is not None else None
             })
-        logging.info("[DB] ✅ Đã ghi dữ liệu vào %s", DB_TABLE_NAME)
+        logging.info("[DB] ✅ Insert OK ts=%s price=%.6f", ts_iso, float(price))
         return True
     except SQLAlchemyError as e:
         logging.error("[DB] SQLAlchemyError: %s", e)
+        logging.debug(traceback.format_exc())
+        # If operational error, drop engine so init will re-run next time
+        try:
+            if isinstance(e.__cause__, OperationalError):
+                logging.warning("[DB] OperationalError detected, dropping DB_ENGINE to retry later")
+                DB_ENGINE = None
+        except Exception:
+            pass
         return False
     except Exception as e:
-        logging.error("[DB] Exception: %s", e)
+        logging.error("[DB] Exception during insert: %s", e)
+        logging.debug(traceback.format_exc())
         return False
 
 # ------------------ State persist ------------------
@@ -435,6 +504,7 @@ def build_alert_message(kind, curr, stats, z_vals, tei, thresholds):
     parts.append(f"{hdr}")
     parts.append(f"📌 TEI: {tei} | Giá: {price_s} | Funding: {funding_s} | OI: {oi_s}")
     parts.append("")
+
     parts.append("🔎 Phân tích chi tiết:")
     parts.append(f"- Funding: {funding_s} | z = {zf:.2f} ({s_f}) {emoji_f} | Δ so với trung bình ≈ {fund_pct:.1f}%")
     parts.append(f"- OI: {oi_s} | z = {zo:.2f} ({s_o}) {emoji_o} | Δ so với trung bình ≈ {oi_pct:.2f}%")
@@ -610,15 +680,6 @@ def make_summary_message_short(kind, samples, alerts):
     # Simpler summary variant used in main loop
     return make_summary_message(kind, samples, alerts)
 
-# (rest of code - follow-up queue, main loop, etc.)
-# For brevity this file retains the remainder of your original logic unchanged.
-# The only functional changes are:
-#  - DB_ENGINE creation with retry above
-#  - write_to_db to include current_price and other_json
-#  - main_loop will call write_to_db(..., current_price=price)
-#
-# Below is the remainder of your original main_loop with the single-call change.
-
 # ------------------ Follow-up 15m & Pro tips queue ------------------
 follow_queue = []  # list of follow tasks
 
@@ -688,13 +749,10 @@ def main_loop():
 
             # optionally write to DB
             if WRITE_TO_DB:
-                if DB_ENGINE:
-                    ts_iso = iso_now_utc()
-                    ok = write_to_db(ts_iso, price, funding, oi, current_price=price)
-                    if ok:
-                        logging.debug("[DB] wrote row at %s", ts_iso)
-                else:
-                    logging.warning("[DB] WRITE_TO_DB=true but DB_ENGINE not configured (DATABASE_URL missing or invalid)")
+                ts_iso = iso_now_utc()
+                ok = write_to_db(ts_iso, price, funding, oi, current_price=price)
+                if ok:
+                    logging.debug("[DB] wrote row at %s", ts_iso)
 
             # realtime stats via buffers
             stats = record_and_update_buffers(price, funding, oi) or compute_stats_realtime()
