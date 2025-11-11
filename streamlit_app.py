@@ -1,6 +1,7 @@
 # streamlit_app.py
 """
 SUI TrapBot — Dashboard compact (UTC+7)
+Compatibility fix: support streamlit versions without experimental_singleton
 - Read-only: không ghi gì vào DB
 - Hiển thị toàn bộ trên một màn hình (wide)
 - Dữ liệu gom theo N phút (mặc định 5 phút)
@@ -71,8 +72,41 @@ try:
 except Exception:
     pass
 
-@st.experimental_singleton(show_spinner=False)
+# --- Compatibility wrapper for caching a DB engine factory ---
+# Prefer st.experimental_singleton -> st.cache_resource -> fallback
+_engine_decorator = None
+if hasattr(st, "experimental_singleton"):
+    _engine_decorator = st.experimental_singleton
+elif hasattr(st, "cache_resource"):
+    _engine_decorator = st.cache_resource
+else:
+    # fallback: simple module-level cache
+    _engine_cache = {}
+    def _fake_singleton(func=None, **kwargs):
+        if func is None:
+            def _wrap(f):
+                name = f.__name__
+                def wrapper(*a, **k):
+                    if name not in _engine_cache:
+                        _engine_cache[name] = f(*a, **k)
+                    return _engine_cache[name]
+                return wrapper
+            return _wrap
+        else:
+            name = func.__name__
+            def wrapper(*a, **k):
+                if name not in _engine_cache:
+                    _engine_cache[name] = func(*a, **k)
+                return _engine_cache[name]
+            return wrapper
+    _engine_decorator = _fake_singleton
+
+@_engine_decorator(show_spinner=False) if callable(_engine_decorator) else (lambda f: f)
 def get_engine(url):
+    """
+    Tạo SQLAlchemy engine an toàn, cached.
+    Sử dụng đc cho nhiều phiên bản Streamlit.
+    """
     try:
         eng = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
         # quick smoke test
@@ -80,6 +114,7 @@ def get_engine(url):
             conn.execute(text("SELECT 1"))
         return eng
     except Exception as e:
+        # show trong sidebar, trả về None để app dừng an toàn
         st.sidebar.error(f"Kết nối DB lỗi: {e}")
         return None
 
@@ -174,11 +209,6 @@ st.markdown("---")
 if not df.empty:
     df_chart = df.set_index("timestamp").copy()
     # chọn cột an toàn
-    cols_to_keep = []
-    for c in ("price","current_price","funding_pct","funding","fund_rate","oi","open_interest"):
-        if c in df_chart.columns:
-            cols_to_keep.append(c)
-    # normalize column names for charts
     if "funding" in df_chart.columns and "funding_pct" not in df_chart.columns:
         df_chart = df_chart.rename(columns={"funding":"funding_pct"})
     if "open_interest" in df_chart.columns and "oi" not in df_chart.columns:
@@ -209,12 +239,11 @@ if not df.empty:
         if "oi" in df_res.columns:
             st.line_chart(df_res[["oi"]])
         else:
-            st.info("Không có dữ liệu OI để vẽ.")
+            st.info("Không có dữ liệu OI.")
 
     with right:
         st.subheader("Alerts (phát hiện cục bộ — tiếng Việt)")
-        # đơn giản: tính mean/std trên window recent
-        window = min(len(df), max(50, int(60 / max(1, RESAMPLE_MIN))))  # chọn window tương đối
+        window = min(len(df), max(50, int(60 / max(1, RESAMPLE_MIN))))
         recent = df.tail(window).set_index("timestamp")
         alerts = []
         try:
@@ -229,7 +258,6 @@ if not df.empty:
             else:
                 om, osd = 0.0, 1e9
 
-            # kiểm tra các mẫu cuối (5 mẫu cuối)
             check_rows = recent.tail(6)
             for idx, row in check_rows.iterrows():
                 ts_s = idx.strftime("%Y-%m-%d %H:%M:%S")
@@ -249,11 +277,10 @@ if not df.empty:
             st.warning(f"Lỗi khi tính alerts: {e}")
 
         if alerts:
-            # sort by time desc
             alerts_sorted = sorted(alerts, key=lambda x: x[3], reverse=True)
             for a in alerts_sorted:
                 _, z, msg, _ = a
-                st.markdown(f"**{msg.splitlines()[1].split(':',1)[1].strip()}**")  # show time line
+                st.markdown(f"**{msg.splitlines()[1].split(':',1)[1].strip()}**")
                 st.info(msg)
         else:
             st.success("Không phát hiện alert bất thường (theo kiểm tra cục bộ).")
