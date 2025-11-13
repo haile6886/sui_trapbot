@@ -1,60 +1,59 @@
 # db_fix_schema.py
-"""
-Script an toàn để đảm bảo schema của trapbot_alerts tồn tại / có các cột cần thiết.
-Chạy script này trong môi trường Railway (railway run python db_fix_schema.py)
-Đảm bảo DATABASE_URL được set trong env của Railway (Railway inject tự động).
-"""
+# Fix schema cho bảng trapbot_alerts trong Railway Postgres
+
 import os
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+
+print("🚀 Running db_fix_schema.py ...")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+
 if not DATABASE_URL:
-    print("ERROR: DATABASE_URL not set in environment. Railway should provide it when using `railway run`.")
-    raise SystemExit(1)
+    print("❌ ERROR: DATABASE_URL not found. Script must run inside Railway environment.")
+    exit(1)
 
 engine = create_engine(DATABASE_URL)
 
-# Safe create table if missing with minimal columns (keeps backward compatibility)
-sql_create_if_missing = f"""
+print("🔌 Connecting to database...")
+
+# Danh sách các cột cần có trong trapbot_alerts
+EXPECTED_COLUMNS = {
+    "ts": "timestamptz",
+    "symbol": "text",
+    "kind": "text",
+    "message": "text",
+    "tei": "integer",
+    "price": "numeric",
+    "funding_pct": "numeric",
+    "oi": "bigint",
+    "z_vals": "jsonb",
+    "meta": "jsonb",
+    "created_at": "timestamptz DEFAULT NOW()"
+}
+
+CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS trapbot_alerts (
-    id BIGSERIAL PRIMARY KEY,
-    ts TIMESTAMPTZ NOT NULL,
-    kind TEXT,
-    message TEXT,
-    tei INTEGER,
-    price NUMERIC,
-    funding_pct NUMERIC,
-    oi BIGINT,
-    z_vals JSONB,
-    meta JSONB,
-    created_at TIMESTAMPTZ DEFAULT now()
+    id BIGSERIAL PRIMARY KEY
 );
 """
 
-# Ensure additional expected columns exist (IF NOT EXISTS)
-sql_alter = f"""
-ALTER TABLE trapbot_alerts
-  ADD COLUMN IF NOT EXISTS symbol TEXT,
-  ADD COLUMN IF NOT EXISTS kind TEXT,
-  ADD COLUMN IF NOT EXISTS message TEXT,
-  ADD COLUMN IF NOT EXISTS tei INTEGER,
-  ADD COLUMN IF NOT EXISTS price NUMERIC,
-  ADD COLUMN IF NOT EXISTS funding_pct NUMERIC,
-  ADD COLUMN IF NOT EXISTS oi BIGINT,
-  ADD COLUMN IF NOT EXISTS z_vals JSONB,
-  ADD COLUMN IF NOT EXISTS meta JSONB,
-  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
-"""
+print("🛠 Creating table if not exists...")
+
+ALTER_SQLS = [
+    f"ALTER TABLE trapbot_alerts ADD COLUMN IF NOT EXISTS {col} {datatype};"
+    for col, datatype in EXPECTED_COLUMNS.items()
+]
 
 try:
     with engine.begin() as conn:
-        print("[DB FIX] Ensuring table trapbot_alerts exists...")
-        conn.execute(text(sql_create_if_missing))
-        print("[DB FIX] Ensuring expected columns exist (ALTER TABLE ... IF NOT EXISTS)...")
-        conn.execute(text(sql_alter))
-    print("[DB FIX] Completed successfully.")
-except SQLAlchemyError as e:
-    print("[DB FIX] SQLAlchemyError:", e)
+        conn.execute(text(CREATE_TABLE_SQL))
+        print("✅ Table OK")
+
+        print("🛠 Applying ALTER TABLE statements...")
+        for sql in ALTER_SQLS:
+            conn.execute(text(sql))
+            print(f"   → {sql}")
+
+    print("\n🎉 DONE — Schema updated successfully!")
 except Exception as e:
-    print("[DB FIX] Unexpected error:", e)
+    print("❌ ERROR while updating schema:", e)
